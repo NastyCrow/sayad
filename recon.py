@@ -15,6 +15,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# ── Fix: ensure modules/ is always importable regardless of how
+#    the script is invoked (sudo, symlink, different cwd, etc.) ──
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 # ── Dependency check ──────────────────────────────────────────
 try:
     from rich.console import Console

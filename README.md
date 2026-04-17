@@ -1,7 +1,20 @@
 # Sayyad Recon Framework
 
-> Automated Bug Bounty Reconnaissance Pipeline  
-> Feed it a domain — get a full attack surface map.
+> Automated Bug Bounty Reconnaissance Pipeline — Python Edition  
+> Feed it a domain. Get a full attack surface map.
+
+---
+
+## What's New in the Python Edition
+
+| Feature | Bash Version | Python Version |
+|---------|-------------|----------------|
+| Subdomain sources | Sequential `&` jobs | True `async` — all 14 sources at once |
+| JSON parsing | Fragile `grep` | Native `json` — rock solid |
+| Resume after crash | ❌ | ✅ Checkpoint after every phase |
+| Scan scope control | ❌ | ✅ Choose which targets get deep scanning |
+| Terminal output | Basic echo | Rich tables, progress bars, panels |
+| API key config | Shell exports only | YAML config file + env var fallback |
 
 ---
 
@@ -11,336 +24,334 @@
 2. [Installation](#installation)
 3. [API Keys Setup](#api-keys-setup)
 4. [Usage](#usage)
-5. [All Options](#all-options)
-6. [Output Structure](#output-structure)
-7. [Pipeline Phases](#pipeline-phases)
-8. [Examples](#examples)
-9. [Security Notes](#security-notes)
-10. [Troubleshooting](#troubleshooting)
+5. [Scan Scope Control](#scan-scope-control)
+6. [Resume After Interruption](#resume-after-interruption)
+7. [All Options](#all-options)
+8. [Output Structure](#output-structure)
+9. [Pipeline Phases](#pipeline-phases)
+10. [Security Notes](#security-notes)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Requirements
 
+- Python 3.9+
 - Kali Linux (or any Debian-based distro)
-- `bash` 4+
-- `python3` (pre-installed on Kali)
-- `curl`, `git`, `nmap` (pre-installed on Kali)
 - Go 1.21+ (for ProjectDiscovery tools)
+- External tools installed via `install_tools.sh`
 
 ---
 
 ## Installation
 
-### Step 1 — Clone or copy the framework
+### Step 1 — Install Python dependencies
 
 ```bash
-git clone https://github.com/yourname/sayyad-recon.git
-cd sayyad-recon
-chmod +x recon.sh install_tools.sh
+pip install -r requirements.txt
 ```
 
-### Step 2 — Install all required tools
+### Step 2 — Install external tools
 
 ```bash
-sudo ./install_tools.sh
-```
-
-This installs: `subfinder`, `httpx`, `dnsx`, `nuclei`, `katana`, `gau`,
-`waybackurls`, `dalfox`, `ffuf`, `paramspider`, `assetfinder`, `amass`, `shodan CLI`
-
-### Step 3 — Reload your shell
-
-```bash
+chmod +x install_tools.sh && sudo ./install_tools.sh
 source ~/.zshrc
-# or
-source ~/.bashrc
 ```
 
-### Step 4 — Verify tools are ready
+### Step 3 — Verify
 
 ```bash
-for tool in subfinder httpx dnsx nuclei katana gau waybackurls nmap; do
-  command -v "$tool" &>/dev/null && echo "✓ $tool" || echo "✗ $tool MISSING"
-done
+python3 recon.py --help
 ```
 
 ---
 
 ## API Keys Setup
 
-API keys are **optional but strongly recommended** — they unlock additional
-subdomain sources and significantly improve coverage.
+Keys are optional but strongly recommended — they unlock 5 additional sources.
 
-| Service | Free Tier | Sign Up |
-|---------|-----------|---------|
-| **Shodan** | Limited free | https://account.shodan.io |
-| **VirusTotal** | 500 req/day | https://virustotal.com/gui/join-us |
-| **SecurityTrails** | 50 req/month | https://securitytrails.com/app/signup |
-| **BeVigil** | Free tier | https://bevigil.com/osint-api |
-| **LeakIX** | Free with signup | https://leakix.net/signup |
+### Option A — Config file (recommended, no exports needed)
 
-### Set keys permanently
+```bash
+mkdir -p ~/.config/sayyad
+cat > ~/.config/sayyad/config.yaml << 'EOF'
+shodan_api_key: "your_key_here"
+virustotal_api_key: "your_key_here"
+securitytrails_api_key: "your_key_here"
+bevigil_api_key: "your_key_here"
+leakix_api_key: "your_key_here"
+EOF
+```
 
-Add to your shell profile (`~/.zshrc` on Kali):
+### Option B — Environment variables
 
 ```bash
 cat >> ~/.zshrc << 'EOF'
-
-# Sayyad Recon — API Keys
 export SHODAN_API_KEY="your_key_here"
 export VIRUSTOTAL_API_KEY="your_key_here"
 export SECURITYTRAILS_API_KEY="your_key_here"
 export BEVIGIL_API_KEY="your_key_here"
 export LEAKIX_API_KEY="your_key_here"
 EOF
-
 source ~/.zshrc
 ```
 
-### Verify keys are loaded
+> Environment variables take priority over the config file if both are set.
 
-```bash
-env | grep -E "SHODAN|VIRUSTOTAL|SECURITYTRAILS|BEVIGIL|LEAKIX"
-```
+### Where to get free keys
 
-> ⚠️ **Never share your API keys.** Never paste them into chat, screenshots,
-> or commit them to Git. If exposed, regenerate them immediately on the
-> provider's website.
+| Service | Free Tier | Sign Up |
+|---------|-----------|---------|
+| Shodan | Limited free | https://account.shodan.io |
+| VirusTotal | 500 req/day | https://virustotal.com/gui/join-us |
+| SecurityTrails | 50 req/month | https://securitytrails.com/app/signup |
+| BeVigil | Free tier | https://bevigil.com/osint-api |
+| LeakIX | Free with signup | https://leakix.net/signup |
 
-### Running as root (important on Kali)
-
-If you run the script with `sudo`, your user environment variables may be
-stripped. Use `-E` to preserve them:
-
-```bash
-sudo -E ./recon.sh -d target.com
-```
-
-Or simply run as root directly (common on Kali):
-
-```bash
-# Add keys to /root/.zshrc instead of /home/user/.zshrc
-cat >> /root/.zshrc << 'EOF'
-export SHODAN_API_KEY="your_key_here"
-...
-EOF
-source /root/.zshrc
-```
+> ⚠️ **Never share your API keys.** Never paste them into chat,
+> screenshots, or Git commits. If exposed, regenerate immediately.
 
 ---
 
 ## Usage
 
-### Basic
-
 ```bash
-./recon.sh -d example.com
+# Quick start
+python3 recon.py -d example.com
+
+# Deep mode
+python3 recon.py -d example.com --deep
+
+# Resume interrupted scan
+python3 recon.py -d example.com --resume
+
+# Suppress API warnings
+python3 recon.py -d example.com --no-api-warnings
 ```
 
-### Deep mode (full active scan + broader port coverage)
+---
+
+## Scan Scope Control
+
+Controls which targets are used for **deep scanning phases**
+(URL crawling, parameter discovery, Nuclei).
+
+This matters because running Nuclei or param discovery against every
+subdomain can hit out-of-scope targets, trigger WAFs, or get your IP banned.
+
+### `--scan-scope main` *(default — safest)*
+
+Only the root domain is deeply scanned. Best starting point.
 
 ```bash
-./recon.sh -d example.com --deep
+python3 recon.py -d example.com --scan-scope main
 ```
 
-### Custom output directory
+### `--scan-scope all`
+
+Every discovered live subdomain is deeply scanned.
+Use only when the programme explicitly puts all subdomains in scope.
 
 ```bash
-./recon.sh -d example.com -o /opt/recon
+python3 recon.py -d example.com --scan-scope all
 ```
 
-### Suppress API key warnings (for clean output when keys aren't needed)
+### `--scan-scope discovered` *(interactive picker)*
+
+After Phase 2, shows you the discovered live hosts and lets you
+choose exactly which ones to deeply scan:
+
+```
+  Discovered live hosts:
+  ──────────────────────────────────────────────────
+  [  1] https://api.example.com
+  [  2] https://admin.example.com
+  [  3] https://staging.example.com
+  [  4] https://mail.example.com
+  ──────────────────────────────────────────────────
+  [  0] Main domain only  (https://example.com)
+
+  Select targets (e.g. 1,3,5 or 1-10 or 'all' or 0 for main): 1,2
+```
 
 ```bash
-./recon.sh -d example.com --no-api-warnings
+python3 recon.py -d example.com --scan-scope discovered
 ```
+
+### `--scan-scope <file.txt>` *(custom targets)*
+
+Read targets from a file (one URL per line):
+
+```bash
+echo "https://api.example.com"   > targets.txt
+echo "https://admin.example.com" >> targets.txt
+python3 recon.py -d example.com --scan-scope targets.txt
+```
+
+---
+
+## Resume After Interruption
+
+If your terminal crashes, SSH drops, or you press **Ctrl+C** by mistake
+— your progress is saved automatically.
+
+### How it works
+
+After every phase completes, `checkpoint.json` is written to the run
+directory. On **Ctrl+C**, the signal is caught before exit:
+
+```
+──────────────── Interrupted ────────────────
+[!] Checkpoint saved → ~/recon/example.com/20260416_093150/checkpoint.json
+[+] Resume your scan with:
+    python3 recon.py -d example.com --resume
+```
+
+### Resuming
+
+```bash
+python3 recon.py -d example.com --resume
+```
+
+The framework finds the most recent incomplete run automatically:
+
+```
+[+] Resumable checkpoint found: ~/recon/example.com/20260416_093150
+
+  Completed phases: phase1, phase2, phase3
+  Started:          2026-04-16 09:31:50
+  Last saved:       2026-04-16 09:45:12
+
+── PHASE 1 — Skipped (checkpoint) ──
+   Loaded 247 subdomains from checkpoint
+── PHASE 2 — Skipped (checkpoint) ──
+   Loaded 89 live hosts from checkpoint
+── PHASE 4 — URL & Endpoint Discovery ──   ← picks up here
+```
+
+### What is saved at each phase
+
+| Phase | Data Saved |
+|-------|-----------|
+| Phase 1 | Full subdomain list |
+| Phase 2 | Live host list |
+| Phase 3+ | Completion flags |
 
 ---
 
 ## All Options
 
 ```
-Usage: ./recon.sh -d <domain> [options]
+Usage: python3 recon.py -d <domain> [options]
 
 Required:
-  -d <domain>           Target domain (e.g. example.com)
+  -d, --domain <domain>       Target domain (e.g. example.com)
 
 Options:
-  -o <dir>              Output directory         (default: ~/recon)
-  -t <threads>          Thread count             (default: 50)
-  -s <severity>         Nuclei severity filter   (default: low,medium,high,critical)
-  --deep                Deep mode: Amass active + full 5000-port scan
-  --skip-nuclei         Skip Nuclei vulnerability scanning
-  --skip-portscan       Skip Nmap port scanning
-  --skip-crawl          Skip URL/endpoint crawling
-  --no-api-warnings     Suppress missing API key warnings
-  -h, --help            Show help message
+  -o, --output <dir>          Output directory         (default: ~/recon)
+  -t, --threads <n>           Thread count             (default: 50)
+  -s, --severity <levels>     Nuclei severity filter   (default: low,medium,high,critical)
+  --deep                      Deep mode: Amass active + full 5000-port scan
+  --resume                    Resume from last checkpoint
+  --scan-scope <mode>         Scope for deep phases:
+                                main        — root domain only (default)
+                                all         — all live subdomains
+                                discovered  — interactive selection
+                                <file.txt>  — custom targets file
+  --skip-nuclei               Skip Nuclei scanning
+  --skip-portscan             Skip port scanning
+  --skip-crawl                Skip URL crawling
+  --no-api-warnings           Suppress missing API key warnings
+  -h, --help                  Show help
 ```
 
 ---
 
 ## Output Structure
 
-Every run creates a timestamped folder:
-
 ```
 ~/recon/
 └── example.com/
     └── 20260416_093150/
+        ├── checkpoint.json             ← resume state (auto-managed)
+        ├── scope_targets.txt           ← targets used for deep scan
         ├── subdomains/
-        │   ├── subfinder.txt       — Subfinder results
-        │   ├── assetfinder.txt     — Assetfinder results
-        │   ├── crtsh.txt           — Certificate transparency
-        │   ├── wayback.txt         — Wayback Machine historical
-        │   ├── otx.txt             — AlienVault OTX passive DNS
-        │   ├── hackertarget.txt    — HackerTarget results
-        │   ├── rapiddns.txt        — RapidDNS results
-        │   ├── urlscan.txt         — URLScan.io results
-        │   ├── shodan.txt          — Shodan DNS (if key set)
-        │   ├── virustotal.txt      — VirusTotal (if key set)
-        │   └── all_subdomains.txt  — Merged & deduplicated
+        │   ├── crtsh.txt
+        │   ├── wayback.txt
+        │   ├── subfinder.txt
+        │   ├── virustotal.txt          (if key set)
+        │   ├── shodan.txt              (if key set)
+        │   └── all_subdomains.txt      ← merged & deduped
         ├── hosts/
-        │   ├── resolved.txt        — DNS-resolved subdomains
-        │   ├── live_urls.txt       — Live HTTP/HTTPS hosts
-        │   └── live_hosts.json     — httpx full JSON (titles, techs, status)
+        │   ├── resolved.txt
+        │   ├── live_urls.txt
+        │   └── live_hosts.json
         ├── urls/
-        │   ├── gau.txt             — Historical URLs (GAU)
-        │   ├── wayback.txt         — Wayback URLs
-        │   ├── katana.txt          — Crawled endpoints
-        │   ├── all_urls.txt        — Merged unique URLs
-        │   └── interesting_endpoints.txt — API/admin/auth/upload paths
+        │   ├── all_urls.txt
+        │   └── interesting_endpoints.txt
         ├── ports/
-        │   ├── target_ips.txt      — IPs scanned
-        │   └── nmap_scan.*         — Nmap results (txt, xml, gnmap)
+        │   └── nmap_scan.*
         ├── nuclei/
-        │   ├── findings.txt        — All vulnerability findings
-        │   ├── findings.json       — Machine-readable findings
-        │   └── critical_high.txt   — Critical & high severity only
+        │   ├── findings.txt
+        │   ├── findings.json
+        │   └── critical_high.txt
         ├── js/
-        │   ├── js_files.txt        — Discovered JS file URLs
-        │   ├── files/              — Downloaded JS files
-        │   ├── potential_secrets.txt — API keys / tokens found in JS
-        │   └── js_endpoints.txt    — API endpoints extracted from JS
+        │   ├── potential_secrets.txt
+        │   └── js_endpoints.txt
         ├── params/
-        │   ├── paramspider.txt     — ParamSpider results
-        │   └── discovered_params.txt — Parameters from all URLs
-        ├── osint/
-        │   └── theharvester.*      — theHarvester output
+        │   └── discovered_params.txt
         └── reports/
-            ├── summary.md          — Human-readable summary report
-            └── recon.log           — Full timestamped run log
+            └── summary.md
 ```
 
 ---
 
 ## Pipeline Phases
 
-| # | Phase | Tools Used | What It Finds |
-|---|-------|-----------|---------------|
-| 1 | Subdomain Enumeration | subfinder, assetfinder, crt.sh, Wayback, OTX, HackerTarget, RapidDNS, URLScan, ThreatCrowd, Shodan*, VT*, ST*, BeVigil*, LeakIX* | All subdomains across 14 sources |
-| 2 | DNS & Live Host Probing | dnsx, httpx | Which subdomains are alive, their tech stack, status codes |
-| 3 | Port Scanning | nmap | Open ports and services on resolved IPs |
-| 4 | URL & Endpoint Discovery | gau, waybackurls, katana | All URLs, JS files, API paths, admin panels |
-| 5 | Parameter Discovery | paramspider, regex extraction | URL parameters across all endpoints |
-| 6 | Vulnerability Scanning | nuclei | Template-based CVEs, misconfigs, exposures |
-| 7 | JS Secret Analysis | curl + regex | API keys, tokens, secrets in JavaScript files |
-| 8 | Report Generation | — | Markdown summary with stats and top findings |
-
-`*` = requires API key
-
----
-
-## Examples
-
-### Quick scan of a bug bounty target
-
-```bash
-./recon.sh -d hackerone.com
-```
-
-### Full deep scan, custom output, only critical findings
-
-```bash
-./recon.sh -d bugcrowd.com --deep -o /opt/recon -s critical
-```
-
-### Scan without port scanning (faster, stealthier)
-
-```bash
-./recon.sh -d target.com --skip-portscan
-```
-
-### Suppress API warnings (clean output for demo/sharing)
-
-```bash
-./recon.sh -d target.com --no-api-warnings
-```
-
-### Chain with AI analysis (feed output to Claude)
-
-After the scan, drop these files into Claude for AI-assisted triage:
-- `interesting_endpoints.txt` → ask for attack surface analysis
-- `potential_secrets.txt` → ask for validation and severity triage
-- `live_hosts.json` → ask which tech stacks deserve deeper testing
-- `nuclei/findings.txt` → ask for exploitability assessment
+| # | Phase | Tools | Respects Scope? |
+|---|-------|-------|----------------|
+| 1 | Subdomain Enumeration | 14 async sources | — |
+| 2 | Live Host Probing | dnsx, httpx | — |
+| 3 | Port Scanning | nmap | — |
+| 4 | URL Discovery | gau, waybackurls, katana | ✅ Yes |
+| 5 | Parameter Discovery | paramspider | ✅ Yes |
+| 6 | Vulnerability Scanning | nuclei | ✅ Yes |
+| 7 | JS Secret Analysis | regex + download | — |
+| 8 | Report | — | — |
 
 ---
 
 ## Security Notes
 
-- **Only scan targets you are authorised to test.** Always verify scope in
-  the programme's policy before running.
-- **API keys are sensitive credentials.** Store them only in your shell
-  profile. Never paste them into chat, emails, screenshots, or Git commits.
-  If exposed, regenerate immediately.
-- **Rate limiting is built in** (`--rate-limit 150` by default) to avoid
-  triggering WAFs or getting your IP banned mid-scan.
-- Nuclei scanning is **active** — it sends HTTP requests to live targets.
-  Use `--skip-nuclei` if you want passive-only recon.
+- **Only test targets you are authorised to scan.**
+- Use `--scan-scope main` (default) until you have confirmed which
+  subdomains are in scope for the programme.
+- Nuclei sends active HTTP requests — use `--skip-nuclei` for passive-only recon.
+- Keep your API keys in `~/.config/sayyad/config.yaml`. Never commit
+  that file to Git — add it to `.gitignore`.
 
 ---
 
 ## Troubleshooting
 
+### Missing Python dependencies
+```bash
+pip install -r requirements.txt
+```
+
 ### Go tools not found after install
-
 ```bash
-export PATH=$PATH:$HOME/go/bin
-source ~/.zshrc
+export PATH=$PATH:$HOME/go/bin && source ~/.zshrc
 ```
 
-### API keys not being read by the script
-
-```bash
-# Check they are exported (not just set)
-env | grep API_KEY
-
-# If missing, reload your profile
-source ~/.zshrc
-
-# If running with sudo, use -E flag
-sudo -E ./recon.sh -d target.com
-```
+### `--resume` says no checkpoint found
+The previous run either completed fully or was cancelled before Phase 1
+finished. Start a fresh run without `--resume`.
 
 ### crt.sh / Wayback returning 0 results
-
-These are external services that can be rate-limited or temporarily down.
-Wait a few minutes and retry, or check if the domain is very new.
-
-### httpx errors
-
-Usually means the live_urls.txt is empty (no resolved subdomains). Check
-that Phase 1 found results and `dnsx` is installed.
-
-### Nuclei skipped
-
-Install with:
-```bash
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-nuclei -update-templates
-```
+External services can be rate-limited or temporarily down.
+Wait a few minutes and retry, or run with `--resume` to skip Phase 1.
 
 ---
 
-*Sayyad Recon Framework — Built for Bug Bounty Hunters*
+*Sayyad Recon Framework — Python Edition*

@@ -504,7 +504,11 @@ Examples:
     parser.add_argument("--skip-nuclei", action="store_true", help="Skip Nuclei scanning")
     parser.add_argument("--skip-portscan", action="store_true", help="Skip Nmap port scan")
     parser.add_argument("--skip-crawl", action="store_true", help="Skip URL crawling")
+    parser.add_argument("--skip-js", action="store_true", help="Skip JS analysis during scan (run later with js_analyze.py)")
     parser.add_argument("--no-api-warnings", action="store_true", help="Suppress missing API key warnings")
+    parser.add_argument("--llm-analyze", action="store_true", help="Feed scan output to local LLM (Ollama) after scan completes")
+    parser.add_argument("--llm-model", default="llama3", metavar="MODEL", help="Ollama model to use (default: llama3)")
+    parser.add_argument("--llm-url", default="http://localhost:11434", metavar="URL", help="Ollama API URL (default: http://localhost:11434)")
     return parser.parse_args()
 
 
@@ -645,9 +649,14 @@ def main():
             console.print(Rule("[dim]PHASE 6 — Skipped (checkpoint)[/dim]"))
 
     # ─────────────────────────────────────────────────────────
-    # PHASE 7 — JS Analysis
+    # PHASE 7 — JS Analysis (optional, run standalone later)
     # ─────────────────────────────────────────────────────────
-    if not chk_mgr.is_done("phase7"):
+    if args.skip_js:
+        console.print(Rule("[dim]PHASE 7 — Skipped (--skip-js)[/dim]"))
+        console.print(f"[yellow][!][/yellow] JS analysis skipped. Run later with:")
+        console.print(f"    [bold cyan]python3 js_analyze.py --scan-dir {run_dir}[/bold cyan]")
+        console.print(f"    [bold cyan]python3 js_analyze.py --scan-dir {run_dir} --llm  (with LLM)[/bold cyan]\n")
+    elif not chk_mgr.is_done("phase7"):
         phase_js(run_dir)
         chk_mgr.complete("phase7", {})
     else:
@@ -658,6 +667,14 @@ def main():
     # ─────────────────────────────────────────────────────────
     phase_report(run_dir, args.domain, config)
     chk_mgr.mark_complete()
+
+    # ─────────────────────────────────────────────────────────
+    # PHASE 9 — LLM Analysis (optional)
+    # ─────────────────────────────────────────────────────────
+    if args.llm_analyze:
+        from modules.llm import LLMAnalyzer
+        analyzer = LLMAnalyzer(model=args.llm_model, base_url=args.llm_url, console=console)
+        analyzer.run(run_dir, args.domain)
 
     # ── Final summary ─────────────────────────────────────────
     console.print()

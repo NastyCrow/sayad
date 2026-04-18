@@ -1,7 +1,20 @@
-# Sayyad Recon Framework
+<p align="center">
+  <img src="SAYYAD_Logo.svg" alt="Sayyad Recon Framework" width="600"/>
+</p>
 
-> Automated Bug Bounty Reconnaissance Pipeline — Python Edition  
-> Feed it a domain. Get a full attack surface map.
+<p align="center">
+  <strong>Automated Bug Bounty Reconnaissance Pipeline — Python Edition</strong><br/>
+  Feed it a domain. Get a full attack surface map.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square&logo=python" />
+  <img src="https://img.shields.io/badge/Platform-Kali%20Linux-557C94?style=flat-square&logo=linux" />
+  <img src="https://img.shields.io/badge/LLM-Ollama-black?style=flat-square" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" />
+</p>
+
+---
 
 ---
 

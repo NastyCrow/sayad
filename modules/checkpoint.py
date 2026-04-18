@@ -15,6 +15,11 @@ from typing import Any, Optional
 
 
 CHECKPOINT_FILE = "checkpoint.json"
+CHECKPOINT_VERSION = 1
+
+
+class CheckpointError(RuntimeError):
+    """Raised when a checkpoint file is corrupt or incompatible."""
 
 
 class CheckpointManager:
@@ -25,29 +30,30 @@ class CheckpointManager:
         self.run_dir: Optional[Path] = None
         self.path: Optional[Path] = None
         self._state: dict = {
-            "version": 1,
-            "domain": "",
-            "started": "",
+            "version":   CHECKPOINT_VERSION,
+            "domain":    "",
+            "started":   "",
             "completed": False,
-            "phases": {},    # phase_name → {"done": bool, "data": {...}}
-            "args": {},
+            "phases":    {},
+            "args":      {},
         }
 
     # ── Initialise a fresh run ────────────────────────────────
     def init(self, run_dir: Path, args):
         self.run_dir = run_dir
         self.path = run_dir / CHECKPOINT_FILE
-        self._state["domain"] = args.domain
-        self._state["started"] = datetime.now().isoformat()
+        self._state["domain"]    = args.domain
+        self._state["started"]   = datetime.now().isoformat()
         self._state["completed"] = False
+        self._state["version"]   = CHECKPOINT_VERSION
         self._state["args"] = {
-            "deep":         args.deep,
-            "scan_scope":   args.scan_scope,
-            "threads":      args.threads,
-            "severity":     args.severity,
-            "skip_nuclei":  args.skip_nuclei,
-            "skip_portscan":args.skip_portscan,
-            "skip_crawl":   args.skip_crawl,
+            "deep":          args.deep,
+            "scan_scope":    args.scan_scope,
+            "threads":       args.threads,
+            "severity":      args.severity,
+            "skip_nuclei":   args.skip_nuclei,
+            "skip_portscan": args.skip_portscan,
+            "skip_crawl":    args.skip_crawl,
         }
         self.save()
 
@@ -55,24 +61,54 @@ class CheckpointManager:
     def load(self, run_dir: Path):
         self.run_dir = run_dir
         self.path = run_dir / CHECKPOINT_FILE
-        if self.path.exists():
-            try:
-                self._state = json.loads(self.path.read_text())
-            except Exception:
-                pass
+
+        if not self.path.exists():
+            raise CheckpointError(f"Checkpoint file not found: {self.path}")
+
+        raw = self.path.read_text()
+        if not raw.strip():
+            raise CheckpointError(f"Checkpoint file is empty: {self.path}")
+
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CheckpointError(
+                f"Checkpoint file is corrupt (JSON parse error): {self.path}\n"
+                f"  Detail: {exc}\n"
+                f"  Start a fresh scan without --resume or delete the file."
+            ) from exc
+
+        # Version check — future-proof
+        ver = state.get("version", 0)
+        if ver != CHECKPOINT_VERSION:
+            raise CheckpointError(
+                f"Checkpoint version mismatch: file has v{ver}, "
+                f"expected v{CHECKPOINT_VERSION}. Start a fresh scan."
+            )
+
+        if "phases" not in state or not isinstance(state["phases"], dict):
+            raise CheckpointError(
+                f"Checkpoint file has unexpected format: {self.path}"
+            )
+
+        self._state = state
 
     # ── Persist state to disk ─────────────────────────────────
     def save(self):
-        if self.path:
-            self._state["last_saved"] = datetime.now().isoformat()
-            self.path.write_text(json.dumps(self._state, indent=2))
+        if not self.path:
+            return
+        self._state["last_saved"] = datetime.now().isoformat()
+        # Atomic write: write to .tmp then rename to avoid partial files
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._state, indent=2))
+        tmp.replace(self.path)
 
     # ── Mark a phase as complete with its output data ─────────
     def complete(self, phase: str, data: dict = None):
         self._state["phases"][phase] = {
             "done":      True,
             "completed": datetime.now().isoformat(),
-            "data":      data or {}
+            "data":      data or {},
         }
         self.save()
 
@@ -87,7 +123,7 @@ class CheckpointManager:
     # ── Mark the full run as finished ─────────────────────────
     def mark_complete(self):
         self._state["completed"] = True
-        self._state["finished"] = datetime.now().isoformat()
+        self._state["finished"]  = datetime.now().isoformat()
         self.save()
 
     # ── Check if any phase data exists (for interrupt handler) ─
@@ -98,8 +134,8 @@ class CheckpointManager:
     def find_resumable(self) -> Optional[Path]:
         """
         Scan all timestamped subdirectories of domain_dir.
-        Return the path of the most recent one that has a checkpoint
-        which is NOT marked as completed.
+        Return the path of the most recent one that has a valid checkpoint
+        that is NOT marked as completed.
         """
         candidates = []
         for entry in sorted(self.domain_dir.iterdir(), reverse=True):
@@ -110,6 +146,8 @@ class CheckpointManager:
                 continue
             try:
                 state = json.loads(cp.read_text())
+                if state.get("version") != CHECKPOINT_VERSION:
+                    continue
                 if not state.get("completed", False) and state.get("phases"):
                     candidates.append((entry, state))
             except Exception:
@@ -118,15 +156,11 @@ class CheckpointManager:
         if not candidates:
             return None
 
-        # Return the most recent resumable run
         best_dir, best_state = candidates[0]
-
-        # Print summary of what was completed
         phases_done = [p for p, v in best_state.get("phases", {}).items() if v.get("done")]
         print(f"\n  Completed phases: {', '.join(phases_done) if phases_done else 'none'}")
         print(f"  Started:          {best_state.get('started', 'unknown')}")
         print(f"  Last saved:       {best_state.get('last_saved', 'unknown')}\n")
-
         return best_dir
 
     # ── Return args from the checkpoint (for resume display) ───

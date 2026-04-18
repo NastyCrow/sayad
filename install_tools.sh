@@ -111,6 +111,7 @@ go_install waybackurls "github.com/tomnomnom/waybackurls@latest"
 go_install anew        "github.com/tomnomnom/anew@latest"
 go_install dalfox      "github.com/hahwul/dalfox/v2@latest"
 go_install ffuf        "github.com/ffuf/ffuf/v2@latest"
+go_install trufflehog  "github.com/trufflesecurity/trufflehog/v3@latest"
 
 # ── pip tools ────────────────────────────────────────────────
 echo ""
@@ -149,7 +150,7 @@ echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━�
 echo ""
 
 for tool in subfinder httpx dnsx nuclei katana chaos gau waybackurls \
-            dalfox ffuf paramspider nmap amass assetfinder shodan; do
+            dalfox ffuf trufflehog paramspider nmap amass assetfinder shodan; do
   if command -v "$tool" &>/dev/null; then
     echo -e "  ${GREEN}✓${RESET} $tool"
   else

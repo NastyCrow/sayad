@@ -11,22 +11,24 @@ Modes:
   <file.txt>  → read targets from a custom file
 """
 
+import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+
+# Maximum size of a custom scope file to load into memory (5 MB)
+_MAX_SCOPE_FILE_BYTES = 5 * 1024 * 1024
 
 
 class ScopeManager:
     def __init__(self, domain: str, live_hosts: list):
         self.domain = domain
-        # Extract clean hostnames/URLs from httpx output lines
         self.live_hosts = self._parse_hosts(live_hosts)
 
     def _parse_hosts(self, raw: list) -> List[str]:
         """Extract base URLs from httpx output (handles 'https://sub.domain.com [200]' format)."""
-        import re
         cleaned = []
         for line in raw:
-            # httpx output can be: https://host.com [200] [Title] ...
             match = re.match(r'(https?://[^\s]+)', line)
             if match:
                 cleaned.append(match.group(1).rstrip("/"))
@@ -34,46 +36,82 @@ class ScopeManager:
 
     def resolve(self, scope_arg: str, console=None) -> List[str]:
         """
-        Resolve scope argument to a list of target URLs/domains.
-
-        Returns a deduplicated list of targets for deep scanning phases.
+        Resolve scope argument to a deduplicated list of target URLs/domains.
         """
-        targets = []
+        targets: List[str] = []
 
-        # ── main: only the root domain ────────────────────────
         if scope_arg == "main":
             targets = [f"https://{self.domain}", f"http://{self.domain}"]
-            targets = [t for t in targets if t]
 
-        # ── all: every discovered live host ───────────────────
         elif scope_arg == "all":
             targets = self.live_hosts if self.live_hosts else [f"https://{self.domain}"]
 
-        # ── discovered: interactive selection ─────────────────
         elif scope_arg == "discovered":
             targets = self._interactive_select(console)
 
-        # ── file path: read from custom file ──────────────────
         else:
-            fpath = Path(scope_arg)
-            if fpath.exists():
-                targets = [l.strip() for l in fpath.read_text().splitlines() if l.strip()]
+            # Custom file path — validate before use
+            resolved = self._validate_scope_file(scope_arg, console)
+            if resolved:
+                targets = [
+                    l.strip() for l in resolved.read_text().splitlines()
+                    if l.strip() and not l.strip().startswith("#")
+                ]
                 if console:
-                    console.print(f"[green][+][/green] Loaded [bold]{len(targets)}[/bold] targets from [cyan]{fpath}[/cyan]")
+                    console.print(
+                        f"[green][+][/green] Loaded [bold]{len(targets)}[/bold] "
+                        f"targets from [cyan]{resolved}[/cyan]"
+                    )
             else:
                 if console:
-                    console.print(f"[red][!][/red] Scope file not found: [bold]{scope_arg}[/bold] — falling back to main domain.")
+                    console.print(
+                        f"[red][!][/red] Scope file not found or invalid: "
+                        f"[bold]{scope_arg}[/bold] — falling back to main domain."
+                    )
                 targets = [f"https://{self.domain}"]
 
-        # Always deduplicate and remove empties
-        seen = set()
-        result = []
+        # Deduplicate, remove empties
+        seen: set = set()
+        result: List[str] = []
         for t in targets:
             if t and t not in seen:
                 seen.add(t)
                 result.append(t)
-
         return result
+
+    def _validate_scope_file(self, path_arg: str, console=None) -> Optional[Path]:
+        """
+        Validate a user-supplied scope file path.
+
+        Checks:
+        - Path exists and is a regular file (not a symlink to outside cwd, not a dir)
+        - No directory-traversal components that escape reasonable bounds
+        - File is not unreasonably large
+        """
+        try:
+            p = Path(path_arg).resolve()
+        except (ValueError, OSError):
+            return None
+
+        if not p.exists():
+            return None
+
+        if not p.is_file():
+            if console:
+                console.print(f"[red][!][/red] Scope path is not a regular file: {p}")
+            return None
+
+        # Guard against accidentally loading huge files into memory
+        size = p.stat().st_size
+        if size > _MAX_SCOPE_FILE_BYTES:
+            if console:
+                console.print(
+                    f"[red][!][/red] Scope file is too large "
+                    f"({size // 1024} KB > {_MAX_SCOPE_FILE_BYTES // 1024} KB limit): {p}"
+                )
+            return None
+
+        return p
 
     def _interactive_select(self, console=None) -> List[str]:
         """
@@ -82,7 +120,9 @@ class ScopeManager:
         """
         if not self.live_hosts:
             if console:
-                console.print("[yellow][!][/yellow] No live hosts discovered yet — defaulting to main domain.")
+                console.print(
+                    "[yellow][!][/yellow] No live hosts discovered — defaulting to main domain."
+                )
             return [f"https://{self.domain}"]
 
         print("\n  Discovered live hosts:")
@@ -94,9 +134,13 @@ class ScopeManager:
         print()
 
         while True:
-            raw = input(
-                "  Select targets (e.g. 1,3,5 or 1-10 or 'all' or 0 for main): "
-            ).strip().lower()
+            try:
+                raw = input(
+                    "  Select targets (e.g. 1,3,5 or 1-10 or 'all' or 0 for main): "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return [f"https://{self.domain}"]
 
             if raw == "0":
                 return [f"https://{self.domain}"]
@@ -120,17 +164,30 @@ class ScopeManager:
             print()
             return targets
 
-    def _parse_selection(self, raw: str, max_n: int):
-        """Parse user input like '1,3,5-8' into a list of integers."""
-        indices = set()
+    def _parse_selection(self, raw: str, max_n: int) -> Optional[List[int]]:
+        """
+        Parse user input like '1,3,5-8' into a sorted list of integers.
+        Returns None on invalid input. Clamps values to [1, max_n].
+        """
+        indices: set = set()
         try:
             for part in raw.split(","):
                 part = part.strip()
+                if not part:
+                    continue
                 if "-" in part:
-                    a, b = part.split("-", 1)
-                    indices.update(range(int(a), int(b) + 1))
+                    a_str, b_str = part.split("-", 1)
+                    a, b = int(a_str), int(b_str)
+                    if a > b:
+                        return None
+                    # Clamp to valid range
+                    a = max(1, a)
+                    b = min(max_n, b)
+                    indices.update(range(a, b + 1))
                 else:
-                    indices.add(int(part))
-            return sorted(indices)
+                    n = int(part)
+                    if 1 <= n <= max_n:
+                        indices.add(n)
+            return sorted(indices) if indices else None
         except ValueError:
             return None

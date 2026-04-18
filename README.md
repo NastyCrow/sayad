@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="SAYYAD_Logo.svg" alt="Sayyad Recon Framework" width="600"/>
+  <img src="SAYAD_Logo.svg" alt="Sayad Recon Framework" width="600"/>
 </p>
 
 <p align="center">
@@ -86,8 +86,8 @@ Keys are optional but strongly recommended — they unlock 5 additional sources.
 ### Option A — Config file (recommended, no exports needed)
 
 ```bash
-mkdir -p ~/.config/sayyad
-cat > ~/.config/sayyad/config.yaml << 'EOF'
+mkdir -p ~/.config/sayad
+cat > ~/.config/sayad/config.yaml << 'EOF'
 shodan_api_key: "your_key_here"
 virustotal_api_key: "your_key_here"
 securitytrails_api_key: "your_key_here"
@@ -340,7 +340,7 @@ Options:
 - Use `--scan-scope main` (default) until you have confirmed which
   subdomains are in scope for the programme.
 - Nuclei sends active HTTP requests — use `--skip-nuclei` for passive-only recon.
-- Keep your API keys in `~/.config/sayyad/config.yaml`. Never commit
+- Keep your API keys in `~/.config/sayad/config.yaml`. Never commit
   that file to Git — add it to `.gitignore`.
 
 ---
@@ -367,4 +367,4 @@ Wait a few minutes and retry, or run with `--resume` to skip Phase 1.
 
 ---
 
-*Sayyad Recon Framework — Python Edition*
+*Sayad Recon Framework — Python Edition*

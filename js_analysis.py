@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔════════════════════════════════════════════╗
-║  Sayyad — Standalone JS Analyser           ║
+║  Sayad — Standalone JS Analyser           ║
 ║  Run JS analysis on any completed scan dir ║
 ╚════════════════════════════════════════════╝
 
@@ -214,7 +214,7 @@ def print_results(secrets: list, endpoints: list, sensitive: list):
 def main():
     parser = argparse.ArgumentParser(
         prog="js_analyze",
-        description="Sayyad — Standalone JS Analyser",
+        description="Sayad — Standalone JS Analyser",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -253,7 +253,7 @@ Examples:
 
     # ── Banner ────────────────────────────────────────────────
     console.print(Panel(
-        "[bold cyan]Sayyad — Standalone JS Analyser[/bold cyan]\n"
+        "[bold cyan]Sayad — Standalone JS Analyser[/bold cyan]\n"
         "Secrets · API Endpoints · Sensitive Paths · LLM Analysis",
         border_style="cyan"
     ))

@@ -1,7 +1,7 @@
 """
 modules/config.py — Configuration and API key management
 Keys are loaded from (in priority order):
-  1. ~/.config/sayyad/config.yaml
+  1. ~/.config/sayad/config.yaml
   2. Environment variables
 """
 
@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-CONFIG_PATH = Path.home() / ".config" / "sayyad" / "config.yaml"
+CONFIG_PATH = Path.home() / ".config" / "sayad" / "config.yaml"
 
 PROVIDERS = {
     "shodan":          ("SHODAN_API_KEY",         "account.shodan.io"),
@@ -77,7 +77,7 @@ class Config:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         if not CONFIG_PATH.exists():
             CONFIG_PATH.write_text("""\
-# Sayyad Recon Framework — API Keys Configuration
+# Sayad Recon Framework — API Keys Configuration
 # Place your API keys here. This file is only read by you locally.
 # NEVER commit this file to Git.
 

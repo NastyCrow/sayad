@@ -25,7 +25,7 @@ console = Console()
 TIMEOUT_API  = 45
 TIMEOUT_TOOL = 180
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SayyadRecon/2.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SayadRecon/2.0)"}
 
 
 def _clean(raw: str, domain: str) -> Set[str]:

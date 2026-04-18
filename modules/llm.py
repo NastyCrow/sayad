@@ -242,7 +242,7 @@ class LLMAnalyzer:
             if summary:
                 summary_file = llm_dir / "TRIAGE_SUMMARY.md"
                 summary_file.write_text(
-                    f"# Sayyad LLM Triage Summary — {domain}\n"
+                    f"# Sayad LLM Triage Summary — {domain}\n"
                     f"**Model:** {self.model}\n\n"
                     f"---\n\n{summary}\n"
                 )

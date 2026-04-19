@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="SAYAD_Logo.svg" alt="Sayad Recon Framework" width="600"/>
+  <img src="SAYAD_Logo.jpg" alt="Sayad Recon Framework" width="600"/>
 </p>
 
 <p align="center">

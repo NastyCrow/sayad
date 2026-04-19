@@ -21,9 +21,12 @@ _MAX_SCOPE_FILE_BYTES = 5 * 1024 * 1024
 
 
 class ScopeManager:
-    def __init__(self, domain: str, live_hosts: list):
+    def __init__(self, domain: str, live_hosts: list, cross_domain_redirects: list = None):
         self.domain = domain
         self.live_hosts = self._parse_hosts(live_hosts)
+        # Set of probed URLs that redirect to an out-of-scope domain — excluded from
+        # active scanning phases to avoid accidentally testing third-party infrastructure.
+        self._cross_srcs: set = {src for src, _ in (cross_domain_redirects or [])}
 
     def _parse_hosts(self, raw: list) -> List[str]:
         """Extract base URLs from httpx output (handles 'https://sub.domain.com [200]' format)."""
@@ -44,7 +47,18 @@ class ScopeManager:
             targets = [f"https://{self.domain}", f"http://{self.domain}"]
 
         elif scope_arg == "all":
-            targets = self.live_hosts if self.live_hosts else [f"https://{self.domain}"]
+            if self.live_hosts:
+                # Exclude hosts that redirect cross-domain — they would pull in
+                # out-of-scope infrastructure during crawl/nuclei phases.
+                filtered = [h for h in self.live_hosts if h not in self._cross_srcs]
+                if self._cross_srcs and console:
+                    console.print(
+                        f"[yellow][!][/yellow] Excluded [bold]{len(self._cross_srcs)}[/bold] "
+                        f"cross-domain redirect host(s) from active scope."
+                    )
+                targets = filtered if filtered else [f"https://{self.domain}"]
+            else:
+                targets = [f"https://{self.domain}"]
 
         elif scope_arg == "discovered":
             targets = self._interactive_select(console)
@@ -126,10 +140,11 @@ class ScopeManager:
             return [f"https://{self.domain}"]
 
         print("\n  Discovered live hosts:")
-        print("  " + "─" * 50)
+        print("  " + "─" * 60)
         for i, host in enumerate(self.live_hosts, 1):
-            print(f"  [{i:>3}] {host}")
-        print("  " + "─" * 50)
+            flag = "  ⚠  cross-domain redirect (excluded from auto-scope)" if host in self._cross_srcs else ""
+            print(f"  [{i:>3}] {host}{flag}")
+        print("  " + "─" * 60)
         print(f"  [  0] Main domain only  (https://{self.domain})")
         print()
 

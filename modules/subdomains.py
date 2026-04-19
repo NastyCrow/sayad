@@ -45,30 +45,40 @@ def _clean(raw: str, domain: str) -> Set[str]:
 
 # ── Error-aware fetch wrapper ─────────────────────────────────
 
-async def _fetch(name: str, coro) -> Tuple[str, Set[str], Optional[str]]:
+async def _fetch(name: str, coro_factory, max_retries: int = 2) -> Tuple[str, Set[str], Optional[str]]:
     """
-    Run a source coroutine and return (name, results, error_msg).
+    Run a source coroutine factory and return (name, results, error_msg).
 
-    error_msg is None on success or empty-but-valid response.
-    Specific HTTP status codes produce actionable messages.
+    coro_factory is a zero-argument callable that returns a fresh coroutine
+    each time it is called (allows clean retries without reusing a spent coro).
+
+    Retries up to max_retries times on transient 5xx server errors (e.g. crt.sh 502)
+    with exponential backoff (1 s, 2 s, …).
     """
-    try:
-        result = await coro
-        return name, result, None
-    except aiohttp.ClientResponseError as e:
-        if e.status in (401, 403):
-            return name, set(), "unauthorized — check API key"
-        if e.status == 429:
-            return name, set(), "rate limited"
-        if e.status >= 500:
-            return name, set(), f"server error ({e.status})"
-        return name, set(), f"HTTP {e.status}"
-    except asyncio.TimeoutError:
-        return name, set(), "timed out"
-    except aiohttp.ClientConnectionError:
-        return name, set(), "connection failed"
-    except Exception as exc:
-        return name, set(), str(exc)[:60]
+    last_error: Optional[str] = None
+    for attempt in range(max_retries + 1):
+        try:
+            result = await coro_factory()
+            return name, result, None
+        except aiohttp.ClientResponseError as e:
+            if e.status in (401, 403):
+                return name, set(), "unauthorized — check API key"
+            if e.status == 429:
+                return name, set(), "rate limited"
+            if e.status >= 500:
+                last_error = f"server error ({e.status})"
+                if attempt < max_retries:
+                    await asyncio.sleep(2.0 ** attempt)   # 1 s → 2 s → …
+                    continue
+                return name, set(), last_error
+            return name, set(), f"HTTP {e.status}"
+        except asyncio.TimeoutError:
+            return name, set(), "timed out"
+        except aiohttp.ClientConnectionError:
+            return name, set(), "connection failed"
+        except Exception as exc:
+            return name, set(), str(exc)[:60]
+    return name, set(), last_error or "unknown error"
 
 
 # ════════════════════════════════════════════════════════════
@@ -309,27 +319,34 @@ async def enumerate_subdomains(domain: str, out: Path, config) -> Set[str]:
         connector = aiohttp.TCPConnector(ssl=False, limit=20)
         async with aiohttp.ClientSession(connector=connector, headers=HEADERS) as session:
 
-            api_coroutines = {
-                "crt.sh":       fetch_crtsh(session, domain),
-                "wayback":      fetch_wayback(session, domain),
-                "otx":          fetch_otx(session, domain),
-                "hackertarget": fetch_hackertarget(session, domain),
-                "rapiddns":     fetch_rapiddns(session, domain),
-                "urlscan":      fetch_urlscan(session, domain),
-                "threatcrowd":  fetch_threatcrowd(session, domain),
+            # Factories (zero-arg callables) so _fetch can create a fresh coroutine
+            # on each retry without reusing a spent coroutine object.
+            api_factories: dict = {
+                "crt.sh":       lambda: fetch_crtsh(session, domain),
+                "wayback":      lambda: fetch_wayback(session, domain),
+                "otx":          lambda: fetch_otx(session, domain),
+                "hackertarget": lambda: fetch_hackertarget(session, domain),
+                "rapiddns":     lambda: fetch_rapiddns(session, domain),
+                "urlscan":      lambda: fetch_urlscan(session, domain),
+                "threatcrowd":  lambda: fetch_threatcrowd(session, domain),
             }
             if config.shodan_api_key:
-                api_coroutines["shodan"] = fetch_shodan(session, domain, config.shodan_api_key)
+                _k = config.shodan_api_key
+                api_factories["shodan"] = lambda: fetch_shodan(session, domain, _k)
             if config.virustotal_api_key:
-                api_coroutines["virustotal"] = fetch_virustotal(session, domain, config.virustotal_api_key)
+                _k = config.virustotal_api_key
+                api_factories["virustotal"] = lambda: fetch_virustotal(session, domain, _k)
             if config.securitytrails_api_key:
-                api_coroutines["securitytrails"] = fetch_securitytrails(session, domain, config.securitytrails_api_key)
+                _k = config.securitytrails_api_key
+                api_factories["securitytrails"] = lambda: fetch_securitytrails(session, domain, _k)
             if config.bevigil_api_key:
-                api_coroutines["bevigil"] = fetch_bevigil(session, domain, config.bevigil_api_key)
+                _k = config.bevigil_api_key
+                api_factories["bevigil"] = lambda: fetch_bevigil(session, domain, _k)
             if config.leakix_api_key:
-                api_coroutines["leakix"] = fetch_leakix(session, domain, config.leakix_api_key)
+                _k = config.leakix_api_key
+                api_factories["leakix"] = lambda: fetch_leakix(session, domain, _k)
 
-            wrapped = [_fetch(name, coro) for name, coro in api_coroutines.items()]
+            wrapped = [_fetch(name, factory) for name, factory in api_factories.items()]
             api_results = await asyncio.gather(*wrapped)
 
             for name, found, error in api_results:

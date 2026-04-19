@@ -121,6 +121,23 @@ def count_lines(path: Path) -> int:
         return 0
 
 
+def _root_domain(hostname: str) -> str:
+    """Return the registrable domain (last two labels).
+
+    Examples:
+        'www.tabby.ai'     → 'tabby.ai'
+        'api.tabby.sa'     → 'tabby.sa'
+        'https://x.y.com/' → 'y.com'
+    """
+    # Strip scheme, path, port, query
+    host = re.sub(r'^https?://', '', hostname).split('/')[0].split('?')[0].split(':')[0]
+    host = host.strip('.')
+    parts = host.lower().split('.')
+    if len(parts) >= 2:
+        return '.'.join(parts[-2:])
+    return host
+
+
 def banner():
     console.print()
     console.print(Panel(
@@ -189,23 +206,66 @@ def scope_safety_prompt(domain: str, scan_scope: str, auto_yes: bool = False) ->
 # Interactive Scope Selector (shown after Phase 2)
 # ─────────────────────────────────────────────────────────────
 
-def interactive_scope_select(domain: str, live_hosts: list) -> str:
+def interactive_scope_select(domain: str, live_hosts: list, cross_domain: list = None) -> str:
     """
     Present a Rich scope-selection panel after live hosts are known.
+
+    Shows a preview of all confirmed live hosts (clean URLs) so the operator
+    can make an informed choice. Cross-domain redirects are flagged with ⚠.
+
     Returns a scope_arg string accepted by ScopeManager.resolve().
     """
-    n = len(live_hosts)
+    cross_domain = cross_domain or []
+    cross_srcs   = {src for src, _ in cross_domain}
+
+    # Extract clean base-URLs from raw httpx output lines for display
+    url_re      = re.compile(r'^(https?://\S+)')
+    clean_hosts = []
+    for line in live_hosts:
+        m = url_re.match(line)
+        if m:
+            clean_hosts.append(m.group(1))
+
+    n = len(clean_hosts)
+
+    # Build host preview (up to 20 lines, cross-domain redirects flagged)
+    preview = ""
+    shown   = min(20, n)
+    for h in clean_hosts[:shown]:
+        flag     = "  [yellow]⚠ cross-domain redirect[/yellow]" if h in cross_srcs else ""
+        preview += f"\n  [dim]•[/dim] [cyan]{h}[/cyan]{flag}"
+    if n > shown:
+        preview += f"\n  [dim]  … and {n - shown} more[/dim]"
+
+    # Cross-domain redirect notice
+    cross_note = ""
+    if cross_domain:
+        cross_note = (
+            f"\n\n  [yellow]⚠  {len(cross_domain)} host(s)[/yellow] redirect to out-of-scope "
+            f"domains and will be\n"
+            f"     [dim]excluded from active scanning automatically (option 2).[/dim]"
+        )
+
+    in_scope_n = n - len(cross_srcs)
+
     console.print()
     console.print(Panel(
-        Text.assemble(
-            (f"  {n} live host{'s' if n != 1 else ''} discovered for ", "white"),
-            (domain, "bold cyan"),
-            ("\n\n", ""),
-            ("  Choose the scope for deep scanning phases:\n\n", "dim"),
-            ("  [bold][1][/bold]  main  ", "white"), ("— root domain only  (fastest, safest)\n", "dim"),
-            (f"  [bold][2][/bold]  all   ", "white"), (f"— all {n} live subdomains\n", "dim"),
-            ("  [bold][3][/bold]  pick  ", "white"), ("— select specific hosts from the list\n", "dim"),
-            ("  [bold][4][/bold]  file  ", "white"), ("— load targets from a custom file\n", "dim"),
+        Text.from_markup(
+            f"  [bold]{n}[/bold] live host{'s' if n != 1 else ''} discovered for "
+            f"[bold cyan]{domain}[/bold cyan]"
+            f"{preview}"
+            f"{cross_note}"
+            f"\n\n"
+            f"  Choose the scope for deep scanning phases:\n\n"
+            f"  [bold][1][/bold]  [white]main [/white]  "
+            f"[dim]— root domain only  (fastest, safest)[/dim]\n"
+            f"  [bold][2][/bold]  [white]all  [/white]  "
+            f"[dim]— {in_scope_n} in-scope host{'s' if in_scope_n != 1 else ''} "
+            f"(cross-domain redirects excluded)[/dim]\n"
+            f"  [bold][3][/bold]  [white]pick [/white]  "
+            f"[dim]— choose specific hosts from the list above[/dim]\n"
+            f"  [bold][4][/bold]  [white]file [/white]  "
+            f"[dim]— load targets from a custom file[/dim]\n"
         ),
         title="[bold cyan]Scope Selection[/bold cyan]",
         border_style="cyan",
@@ -240,19 +300,26 @@ def interactive_scope_select(domain: str, live_hosts: list) -> str:
 # Phase 2 — DNS Resolution & Live Host Probing
 # ─────────────────────────────────────────────────────────────
 
-def phase_probing(out: Path, threads: int) -> list:
+def phase_probing(out: Path, domain: str, threads: int) -> tuple:
+    """
+    Phase 2: DNS resolution (dnsx) + HTTP probing (httpx).
+
+    Returns:
+        live_lines   (list[str])   — raw httpx output lines for every responding host
+        cross_domain (list[tuple]) — (probed_url, redirect_url) pairs where the redirect
+                                     target is on a different root domain (out-of-scope)
+    """
     console.print(Rule("[bold cyan]PHASE 2 — DNS Resolution & Live Host Probing[/bold cyan]"))
 
     all_subs  = out / "subdomains" / "all_subdomains.txt"
     resolved  = out / "hosts" / "resolved.txt"
     live_urls = out / "hosts" / "live_urls.txt"
-    live_json = out / "hosts" / "live_hosts.json"
 
     if not all_subs.exists() or count_lines(all_subs) == 0:
         console.print("[yellow][!][/yellow] No subdomains found — skipping probing.")
-        return []
+        return [], []
 
-    # -resp embeds IPs in output: "hostname [1.2.3.4]" — needed for nmap phase
+    # DNS resolution — -resp embeds IPs ("hostname [1.2.3.4]") needed by nmap
     with console.status("[cyan]Resolving DNS with dnsx...[/cyan]"):
         run_tool(
             ["dnsx", "-l", str(all_subs), "-silent", "-o", str(resolved),
@@ -262,20 +329,59 @@ def phase_probing(out: Path, threads: int) -> list:
     if resolved.exists():
         console.print(f"[green][+][/green] DNS resolved: [bold]{count_lines(resolved)}[/bold] hosts")
 
+    # HTTP probing:
+    #   -no-follow-redirects → keep 3xx codes visible so we can detect cross-domain hops
+    #   -location            → capture the Location header value for redirect lines
     with console.status("[cyan]Probing live HTTP hosts with httpx...[/cyan]"):
         run_tool([
             "httpx", "-l", str(all_subs),
             "-silent", "-title", "-status-code", "-tech-detect",
-            "-content-length", "-ip",
+            "-content-length", "-ip", "-location",
+            "-no-follow-redirects",
             "-threads", str(threads),
             "-o", str(live_urls),
         ], timeout=400)
 
+    live_lines: list   = []
+    cross_domain: list = []
+    root = _root_domain(domain)
+
+    # Regex to find a trailing [...] that looks like an absolute URL — the Location value
+    redirect_re = re.compile(r'\[(https?://[^\]]+)\]\s*$')
+
     if live_urls.exists():
-        live = [l for l in live_urls.read_text().splitlines() if l.strip()]
-        console.print(f"[green][+][/green] Live HTTP hosts: [bold]{len(live)}[/bold]")
-        return live
-    return []
+        for line in live_urls.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            live_lines.append(line)
+
+            # Detect cross-domain redirect: last bracket is a URL on a foreign root domain
+            m = redirect_re.search(line)
+            if m:
+                redirect_url  = m.group(1)
+                redirect_host = redirect_url.split("//", 1)[-1].split("/")[0].split(":")[0]
+                redirect_root = _root_domain(redirect_host)
+                if redirect_root and redirect_root != root:
+                    probed = re.match(r'(https?://\S+)', line)
+                    if probed:
+                        cross_domain.append((probed.group(1), redirect_url))
+
+    console.print(f"[green][+][/green] Live HTTP hosts: [bold]{len(live_lines)}[/bold]")
+
+    if cross_domain:
+        redir_file = out / "hosts" / "cross_domain_redirects.txt"
+        redir_file.write_text("\n".join(f"{s} → {d}" for s, d in cross_domain))
+        console.print(
+            f"[yellow][!][/yellow] [bold yellow]{len(cross_domain)}[/bold yellow] host(s) redirect "
+            f"to out-of-scope domain(s) — will be excluded from active scanning:"
+        )
+        for src, dst in cross_domain[:5]:
+            console.print(f"   [yellow]↪[/yellow] {src}  →  [dim]{dst}[/dim]")
+        if len(cross_domain) > 5:
+            console.print(f"   [dim]  …and {len(cross_domain) - 5} more (hosts/cross_domain_redirects.txt)[/dim]")
+
+    return live_lines, cross_domain
 
 
 # ─────────────────────────────────────────────────────────────
@@ -399,11 +505,12 @@ def phase_crawl(out: Path, scope_targets: list, threads: int):
 
     console.print(f"[green][+][/green] Crawling [bold]{len(scope_targets)}[/bold] scoped target(s)")
 
-    # GAU
+    # GAU — --retries 2 handles transient 502/5xx from Wayback/CommonCrawl upstreams
     with console.status("[cyan]Running GAU (historical URLs)...[/cyan]"):
         gau_out = urls_dir / "gau.txt"
         run_tool([
             "gau", "--threads", str(threads),
+            "--retries", "2",
             "--blacklist", "png,jpg,gif,svg,ico,css,woff,ttf",
             "--o", str(gau_out),
         ] + scope_targets, timeout=300)
@@ -858,11 +965,15 @@ def main():
     # PHASE 2 — DNS & Live Host Probing
     # ─────────────────────────────────────────────────────────
     if not chk_mgr.is_done("phase2"):
-        live_hosts = phase_probing(run_dir, args.threads)
-        chk_mgr.complete("phase2", {"live_hosts": live_hosts})
+        live_hosts, cross_domain = phase_probing(run_dir, _domain, args.threads)
+        chk_mgr.complete("phase2", {
+            "live_hosts":             live_hosts,
+            "cross_domain_redirects": [list(pair) for pair in cross_domain],
+        })
     else:
         console.print(Rule("[dim]PHASE 2 — Skipped (checkpoint)[/dim]"))
-        live_hosts = chk_mgr.get("phase2", "live_hosts")
+        live_hosts   = chk_mgr.get("phase2", "live_hosts")
+        cross_domain = [tuple(p) for p in (chk_mgr.get("phase2", "cross_domain_redirects") or [])]
         console.print(f"[green][+][/green] Loaded [bold]{len(live_hosts)}[/bold] live hosts from checkpoint")
 
     # ── Interactive scope selection (if --scan-scope not provided) ──
@@ -870,7 +981,7 @@ def main():
         if args.yes:
             args.scan_scope = "main"
         else:
-            args.scan_scope = interactive_scope_select(_domain, live_hosts)
+            args.scan_scope = interactive_scope_select(_domain, live_hosts, cross_domain)
 
     # ─────────────────────────────────────────────────────────
     # PHASE 3 — Port Scanning
@@ -885,7 +996,7 @@ def main():
     # ─────────────────────────────────────────────────────────
     # Resolve scan scope
     # ─────────────────────────────────────────────────────────
-    scope_mgr    = ScopeManager(_domain, live_hosts)
+    scope_mgr     = ScopeManager(_domain, live_hosts, cross_domain_redirects=cross_domain)
     scope_targets = scope_mgr.resolve(args.scan_scope, console)
     console.print(f"\n[bold]Scan scope resolved:[/bold] [yellow]{len(scope_targets)} target(s)[/yellow]")
     for t in scope_targets[:10]:

@@ -130,7 +130,7 @@ def banner():
             (" \\___ \\ / _ \\   \\ V /    \\ V /  | |_| |\n", "bold magenta"),
             ("  ___) / ___ \\   | |      | |    \\__  |\n", "bold magenta"),
             (" |____/_/   \\_\\  |_|      |_|      |_/\n", "bold magenta"),
-            ("   RECON FRAMEWORK — Python Edition", "bold cyan"),
+            ("   SAYAD — RECON FRAMEWORK", "bold cyan"),
         ),
         border_style="magenta",
         padding=(0, 2),

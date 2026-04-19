@@ -186,6 +186,57 @@ def scope_safety_prompt(domain: str, scan_scope: str, auto_yes: bool = False) ->
 
 
 # ─────────────────────────────────────────────────────────────
+# Interactive Scope Selector (shown after Phase 2)
+# ─────────────────────────────────────────────────────────────
+
+def interactive_scope_select(domain: str, live_hosts: list) -> str:
+    """
+    Present a Rich scope-selection panel after live hosts are known.
+    Returns a scope_arg string accepted by ScopeManager.resolve().
+    """
+    n = len(live_hosts)
+    console.print()
+    console.print(Panel(
+        Text.assemble(
+            (f"  {n} live host{'s' if n != 1 else ''} discovered for ", "white"),
+            (domain, "bold cyan"),
+            ("\n\n", ""),
+            ("  Choose the scope for deep scanning phases:\n\n", "dim"),
+            ("  [bold][1][/bold]  main  ", "white"), ("— root domain only  (fastest, safest)\n", "dim"),
+            (f"  [bold][2][/bold]  all   ", "white"), (f"— all {n} live subdomains\n", "dim"),
+            ("  [bold][3][/bold]  pick  ", "white"), ("— select specific hosts from the list\n", "dim"),
+            ("  [bold][4][/bold]  file  ", "white"), ("— load targets from a custom file\n", "dim"),
+        ),
+        title="[bold cyan]Scope Selection[/bold cyan]",
+        border_style="cyan",
+        padding=(0, 2),
+    ))
+
+    while True:
+        choice = Prompt.ask(
+            "  Select scope",
+            choices=["1", "2", "3", "4"],
+            default="1",
+        ).strip()
+
+        if choice == "1":
+            console.print()
+            return "main"
+        if choice == "2":
+            console.print()
+            return "all"
+        if choice == "3":
+            console.print()
+            return "discovered"
+        if choice == "4":
+            fpath = Prompt.ask("  Path to targets file").strip()
+            if Path(fpath).expanduser().exists():
+                console.print()
+                return fpath
+            console.print(f"[red][!][/red] File not found: {fpath} — try again.")
+
+
+# ─────────────────────────────────────────────────────────────
 # Phase 2 — DNS Resolution & Live Host Probing
 # ─────────────────────────────────────────────────────────────
 
@@ -201,9 +252,11 @@ def phase_probing(out: Path, threads: int) -> list:
         console.print("[yellow][!][/yellow] No subdomains found — skipping probing.")
         return []
 
+    # -resp embeds IPs in output: "hostname [1.2.3.4]" — needed for nmap phase
     with console.status("[cyan]Resolving DNS with dnsx...[/cyan]"):
         run_tool(
-            ["dnsx", "-l", str(all_subs), "-silent", "-o", str(resolved), "-t", str(threads)],
+            ["dnsx", "-l", str(all_subs), "-silent", "-o", str(resolved),
+             "-t", str(threads), "-resp"],
             timeout=300,
         )
     if resolved.exists():
@@ -216,7 +269,6 @@ def phase_probing(out: Path, threads: int) -> list:
             "-content-length", "-ip",
             "-threads", str(threads),
             "-o", str(live_urls),
-            "-json", "-output", str(live_json),
         ], timeout=400)
 
     if live_urls.exists():
@@ -422,7 +474,7 @@ def phase_params(out: Path, scope_targets: list):
         tag      = hashlib.md5(target.encode()).hexdigest()[:8]
         out_file = params_dir / f"paramspider_{tag}.txt"
         run_tool(
-            ["paramspider", "-d", hostname, "-o", str(out_file)],
+            ["paramspider", "-d", hostname, "--output", str(out_file)],
             timeout=120,
         )
 
@@ -459,24 +511,16 @@ def phase_params(out: Path, scope_targets: list):
 def phase_nuclei(out: Path, scope_targets: list, severity: str, threads: int, notifier=None, domain: str = ""):
     console.print(Rule("[bold cyan]PHASE 6 — Nuclei Vulnerability Scanning[/bold cyan]"))
 
-    live_urls  = out / "hosts" / "live_urls.txt"
     nuclei_dir = out / "nuclei"
 
-    if live_urls.exists() and scope_targets:
-        scoped_live = [
-            u for u in live_urls.read_text().splitlines()
-            if any(t in u for t in scope_targets)
-        ]
-    else:
-        scoped_live = []
-
-    if not scoped_live:
-        console.print("[yellow][!][/yellow] No live scoped hosts for Nuclei — skipping.")
+    if not scope_targets:
+        console.print("[yellow][!][/yellow] No targets in scope — skipping Nuclei.")
         return
 
+    # Use scope_targets directly — they already represent the confirmed live hosts
     scoped_file = nuclei_dir / "scoped_live.txt"
-    scoped_file.write_text("\n".join(scoped_live))
-    console.print(f"[green][+][/green] Scanning [bold]{len(scoped_live)}[/bold] scoped hosts")
+    scoped_file.write_text("\n".join(scope_targets))
+    console.print(f"[green][+][/green] Scanning [bold]{len(scope_targets)}[/bold] scoped targets")
 
     with console.status("[cyan]Updating Nuclei templates...[/cyan]"):
         run_tool(["nuclei", "-update-templates", "-silent"], timeout=120)
@@ -690,10 +734,11 @@ Examples:
     parser.add_argument("--deep", action="store_true", help="Deep mode: active Amass + full port scan")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     parser.add_argument(
-        "--scan-scope", default="main", metavar="SCOPE",
+        "--scan-scope", default=None, metavar="SCOPE",
         help=(
             "Scope for deep scanning phases (crawl, params, nuclei).\n"
-            "  main        — main domain only (default, safest)\n"
+            "  (omit)      — interactive prompt shown after Phase 2 (default)\n"
+            "  main        — root domain only (fastest, safest)\n"
             "  all         — all discovered live subdomains\n"
             "  discovered  — interactively pick from discovered hosts\n"
             "  <file.txt>  — use a custom targets file"
@@ -733,7 +778,8 @@ def main():
     Config.create_template()
 
     # ── Scope safety confirmation ──────────────────────────────
-    if not scope_safety_prompt(_domain, args.scan_scope, auto_yes=args.yes):
+    scope_display = args.scan_scope or "interactive (selected after Phase 2)"
+    if not scope_safety_prompt(_domain, scope_display, auto_yes=args.yes):
         sys.exit(0)
 
     # ── Output directory ──────────────────────────────────────
@@ -782,7 +828,7 @@ def main():
     info.add_column()
     info.add_row("Target",     f"[bold cyan]{_domain}[/bold cyan]")
     info.add_row("Output",     str(run_dir))
-    info.add_row("Scan Scope", f"[yellow]{args.scan_scope}[/yellow]")
+    info.add_row("Scan Scope", f"[yellow]{args.scan_scope or 'interactive'}[/yellow]")
     info.add_row("Deep Mode",  str(args.deep))
     info.add_row("Threads",    str(args.threads))
     info.add_row("GitHub Dork", "enabled" if args.github_dork else "disabled")
@@ -818,6 +864,13 @@ def main():
         console.print(Rule("[dim]PHASE 2 — Skipped (checkpoint)[/dim]"))
         live_hosts = chk_mgr.get("phase2", "live_hosts")
         console.print(f"[green][+][/green] Loaded [bold]{len(live_hosts)}[/bold] live hosts from checkpoint")
+
+    # ── Interactive scope selection (if --scan-scope not provided) ──
+    if args.scan_scope is None:
+        if args.yes:
+            args.scan_scope = "main"
+        else:
+            args.scan_scope = interactive_scope_select(_domain, live_hosts)
 
     # ─────────────────────────────────────────────────────────
     # PHASE 3 — Port Scanning

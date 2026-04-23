@@ -8,6 +8,7 @@
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import signal
@@ -47,6 +48,7 @@ console = Console()
 _checkpoint: CheckpointManager = None
 _domain: str = ""
 _out: Path = None
+_verbose: bool = False   # toggled by --verbose; gates stderr & per-item diagnostics
 
 
 # ─────────────────────────────────────────────────────────────
@@ -98,8 +100,9 @@ def run_tool(cmd: list, out_file: Path = None, timeout: int = 300) -> str:
         output = result.stdout.strip()
         if out_file and output:
             out_file.write_text(output)
-        # Log stderr if tool produced warnings/errors (non-empty, non-whitespace)
-        if result.stderr and result.stderr.strip():
+        # Only surface stderr when --verbose is on; otherwise keep output quiet.
+        # (Most tools emit harmless warnings/progress to stderr that clutter the UI.)
+        if _verbose and result.stderr and result.stderr.strip():
             stderr_preview = result.stderr.strip().splitlines()[0][:120]
             console.print(f"[dim]  [{cmd[0]}] stderr: {stderr_preview}[/dim]")
         return output
@@ -142,11 +145,11 @@ def banner():
     console.print()
     console.print(Panel(
         Text.assemble(
-            ("  ____    _    __   __   __   _    ____\n", "bold magenta"),
-            (" / ___|  / \\   \\ \\ / /  \\ \\ / /  / _  |\n", "bold magenta"),
-            (" \\___ \\ / _ \\   \\ V /    \\ V /  | |_| |\n", "bold magenta"),
-            ("  ___) / ___ \\   | |      | |    \\__  |\n", "bold magenta"),
-            (" |____/_/   \\_\\  |_|      |_|      |_/\n", "bold magenta"),
+            (" ____     _    __   __    _    ____  \n", "bold magenta"),
+            ("/ ___|   / \\   \\ \\ / /   / \\  |  _ \\ \n", "bold magenta"),
+            ("\\___ \\  / _ \\   \\ V /   / _ \\ | | | |\n", "bold magenta"),
+            (" ___) |/ ___ \\   | |   / ___ \\| |_| |\n", "bold magenta"),
+            ("|____/_/   \\_\\   |_|  /_/   \\_\\____/ \n", "bold magenta"),
             ("   SAYAD — RECON FRAMEWORK", "bold cyan"),
         ),
         border_style="magenta",
@@ -330,14 +333,14 @@ def phase_probing(out: Path, domain: str, threads: int) -> tuple:
         console.print(f"[green][+][/green] DNS resolved: [bold]{count_lines(resolved)}[/bold] hosts")
 
     # HTTP probing:
-    #   -no-follow-redirects → keep 3xx codes visible so we can detect cross-domain hops
-    #   -location            → capture the Location header value for redirect lines
+    #   (default httpx behaviour is already NOT to follow redirects — no flag needed;
+    #    passing a non-existent `-no-follow-redirects` triggers "Usage: httpx" on stderr)
+    #   -location → capture the Location header value so we can detect cross-domain hops
     with console.status("[cyan]Probing live HTTP hosts with httpx...[/cyan]"):
         run_tool([
             "httpx", "-l", str(all_subs),
             "-silent", "-title", "-status-code", "-tech-detect",
             "-content-length", "-ip", "-location",
-            "-no-follow-redirects",
             "-threads", str(threads),
             "-o", str(live_urls),
         ], timeout=400)
@@ -366,6 +369,25 @@ def phase_probing(out: Path, domain: str, threads: int) -> tuple:
                     probed = re.match(r'(https?://\S+)', line)
                     if probed:
                         cross_domain.append((probed.group(1), redirect_url))
+
+    # ── Fallback: if httpx produced nothing (network glitch, 5xx cascade, etc.)
+    # but DNS resolution found hosts, treat each resolved hostname as a candidate
+    # live host. Without this, scope "all"/"discovered" silently collapses to just
+    # the main domain because self.live_hosts in ScopeManager is empty.
+    if not live_lines and resolved.exists():
+        host_re = re.compile(r'^([a-zA-Z0-9_.\-]+)')
+        resolved_hosts = set()
+        for line in resolved.read_text(errors="ignore").splitlines():
+            m = host_re.match(line.strip())
+            if m:
+                resolved_hosts.add(m.group(1).lower())
+        if resolved_hosts:
+            live_lines = [f"https://{h}" for h in sorted(resolved_hosts)]
+            live_urls.write_text("\n".join(live_lines))
+            console.print(
+                f"[yellow][!][/yellow] httpx returned no output — falling back to "
+                f"[bold]{len(live_lines)}[/bold] DNS-resolved host(s) for scope selection."
+            )
 
     console.print(f"[green][+][/green] Live HTTP hosts: [bold]{len(live_lines)}[/bold]")
 
@@ -688,7 +710,9 @@ def phase_js(out: Path):
     secrets: list  = []
     endpoints: set = set()
     sensitive: set = set()
-    download_errors = 0
+    download_errors  = 0
+    download_success = 0
+    error_reasons: dict = {}   # exception class name → count (for verbose breakdown)
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(),
                   TextColumn("{task.completed}/{task.total}"), console=console) as progress:
@@ -706,11 +730,16 @@ def phase_js(out: Path):
                         content = resp.read().decode("utf-8", errors="ignore")
                     if content.strip():
                         fpath.write_text(content)
+                        download_success += 1
                 except Exception as exc:
                     download_errors += 1
-                    console.print(f"[dim]  [JS] download failed {url.split('/')[-1]}: {type(exc).__name__}[/dim]")
+                    err_name = type(exc).__name__
+                    error_reasons[err_name] = error_reasons.get(err_name, 0) + 1
+                    # No per-URL print — user wants a simple success/failure tally.
                     progress.advance(task)
                     continue
+            else:
+                download_success += 1
 
             try:
                 content = fpath.read_text(errors="ignore")
@@ -732,8 +761,15 @@ def phase_js(out: Path):
 
             progress.advance(task)
 
-    if download_errors:
-        console.print(f"[yellow][!][/yellow] {download_errors} JS file(s) failed to download")
+    # Simple success/failure tally (no per-URL noise). Full breakdown only in --verbose.
+    console.print(
+        f"[green][+][/green] JS downloads: "
+        f"[green]{download_success} OK[/green] / "
+        f"[{'yellow' if download_errors else 'dim'}]{download_errors} failed[/]"
+    )
+    if _verbose and error_reasons:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(error_reasons.items()))
+        console.print(f"[dim]    └─ {breakdown}[/dim]")
 
     (js_dir / "potential_secrets.txt").write_text("\n".join(sorted(set(secrets))))
     (js_dir / "js_endpoints.txt").write_text("\n".join(sorted(endpoints)))
@@ -744,73 +780,349 @@ def phase_js(out: Path):
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 7b — Directory Discovery (ffuf)
+# ─────────────────────────────────────────────────────────────
+
+# Common wordlist search paths, in priority order.
+# Users with SecLists installed anywhere standard will get it automatically.
+_WORDLIST_CANDIDATES = [
+    Path.home() / "SecLists" / "Discovery" / "Web-Content" / "common.txt",
+    Path.home() / "tools" / "SecLists" / "Discovery" / "Web-Content" / "common.txt",
+    Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),
+    Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),
+    Path("/usr/share/wordlists/dirb/common.txt"),
+    Path("/opt/SecLists/Discovery/Web-Content/common.txt"),
+]
+
+
+def _find_wordlist() -> Path:
+    for p in _WORDLIST_CANDIDATES:
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def phase_dirs(out: Path, scope_targets: list, threads: int):
+    """
+    Run ffuf against each scoped target to discover directories and endpoints.
+    Writes per-target JSON results to dirs/ffuf_<tag>.json and a consolidated
+    per_target.json mapping target → list of {path, status, length, url}.
+    """
+    console.print(Rule("[bold cyan]PHASE — Directory Discovery (ffuf)[/bold cyan]"))
+
+    dirs_dir = out / "dirs"
+    dirs_dir.mkdir(exist_ok=True)
+
+    if not scope_targets:
+        console.print("[yellow][!][/yellow] No targets in scope — skipping ffuf.")
+        return
+
+    wordlist = _find_wordlist()
+    if not wordlist:
+        console.print(
+            "[yellow][!][/yellow] No wordlist found (looked for SecLists/common.txt, "
+            "dirb/common.txt) — skipping ffuf. Install SecLists to enable."
+        )
+        return
+
+    console.print(f"[green][+][/green] Wordlist: [dim]{wordlist}[/dim]")
+    console.print(f"[green][+][/green] Fuzzing [bold]{len(scope_targets)}[/bold] target(s)")
+
+    import hashlib
+    per_target: dict = {}
+
+    def _run_ffuf(target: str):
+        tag      = hashlib.md5(target.encode()).hexdigest()[:8]
+        out_json = dirs_dir / f"ffuf_{tag}.json"
+        fuzz_url = target.rstrip("/") + "/FUZZ"
+        # -mc: only keep codes suggesting the path exists (skip 404s, the default).
+        # -s: silent mode; -ac: auto-calibrate filtering to suppress soft-404s.
+        run_tool([
+            "ffuf",
+            "-u", fuzz_url,
+            "-w", str(wordlist),
+            "-mc", "200,201,204,301,302,307,308,401,403,405",
+            "-t", str(threads),
+            "-o", str(out_json),
+            "-of", "json",
+            "-ac",
+            "-s",
+            "-timeout", "8",
+        ], timeout=900)
+
+        hits = []
+        if out_json.exists():
+            try:
+                data = json.loads(out_json.read_text(errors="ignore"))
+                for r in data.get("results", []):
+                    hits.append({
+                        "path":   r.get("input", {}).get("FUZZ", ""),
+                        "status": r.get("status", 0),
+                        "length": r.get("length", 0),
+                        "url":    r.get("url", ""),
+                    })
+            except Exception:
+                pass  # malformed JSON — skip
+        return target, hits
+
+    # ffuf is I/O heavy; cap at 3 concurrent targets to avoid saturating the network.
+    workers = max(1, min(3, len(scope_targets)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_run_ffuf, t): t for t in scope_targets}
+        for future in as_completed(futures):
+            try:
+                target, hits = future.result()
+                per_target[target] = hits
+            except Exception as exc:
+                if _verbose:
+                    console.print(f"[yellow][!][/yellow] ffuf error for {futures[future]}: {exc}")
+
+    # Consolidated outputs consumed by the report phase
+    total_hits = sum(len(h) for h in per_target.values())
+    with open(dirs_dir / "all_dirs.txt", "w") as f:
+        for target, hits in per_target.items():
+            for h in hits:
+                f.write(f"[{h['status']}] {h['url']}\n")
+    (dirs_dir / "per_target.json").write_text(json.dumps(per_target, indent=2))
+
+    console.print(
+        f"[green][+][/green] Directories discovered: [bold]{total_hits}[/bold] "
+        f"across {len(per_target)} target(s)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Phase 8 — Report
 # ─────────────────────────────────────────────────────────────
 
-def phase_report(out: Path, domain: str, dork_hits: int = 0):
+def _hostname(url_or_target: str) -> str:
+    """Strip scheme/port/path from a URL-or-hostname, lowercased."""
+    h = re.sub(r'^https?://', '', url_or_target)
+    h = h.split('/', 1)[0].split('?', 1)[0].split(':', 1)[0]
+    return h.lower()
+
+
+def _build_per_target_breakdown(out: Path, scope_targets: list) -> dict:
+    """
+    Group parameters, endpoints, directories, and nuclei findings by the
+    scope target (hostname) they belong to. Used by the final report.
+    """
+    # Keyed by hostname so we can map arbitrary URLs back to their parent target.
+    by_host: dict = {
+        _hostname(t): {
+            "target":     t,
+            "params":     set(),
+            "endpoints":  set(),
+            "dirs":       [],
+            "findings":   [],
+        }
+        for t in scope_targets
+    }
+
+    def _bucket(host: str):
+        return by_host.get(host)
+
+    # ── Parameters + endpoints from all_urls.txt ──────────────
+    all_urls = out / "urls" / "all_urls.txt"
+    interesting_keywords = re.compile(
+        r"(api|admin|auth|login|upload|dashboard|graphql|swagger|debug|"
+        r"config|backup|\.json|\.xml|\.env|\.git|internal|secret|token|"
+        r"key|reset|password|register|oauth|webhook)",
+        re.I,
+    )
+    if all_urls.exists():
+        for url in all_urls.read_text(errors="ignore").splitlines():
+            url = url.strip()
+            if not url.startswith("http"):
+                continue
+            host = _hostname(url)
+            b = _bucket(host)
+            if not b:
+                continue
+            if "?" in url:
+                for pair in url.split("?", 1)[1].split("&"):
+                    p = pair.split("=", 1)[0].strip()
+                    if p:
+                        b["params"].add(p)
+            if interesting_keywords.search(url):
+                b["endpoints"].add(url)
+
+    # ── Directories (ffuf per_target.json) ────────────────────
+    ffuf_json = out / "dirs" / "per_target.json"
+    if ffuf_json.exists():
+        try:
+            data = json.loads(ffuf_json.read_text(errors="ignore"))
+            for target, hits in data.items():
+                host = _hostname(target)
+                b = _bucket(host)
+                if b:
+                    b["dirs"] = hits
+        except Exception:
+            pass
+
+    # ── Nuclei findings: match each line's URL to the closest host ──
+    nuclei = out / "nuclei" / "findings.txt"
+    url_in_line = re.compile(r'(https?://[^\s]+)')
+    if nuclei.exists():
+        for line in nuclei.read_text(errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            m = url_in_line.search(line)
+            if not m:
+                continue
+            host = _hostname(m.group(1))
+            b = _bucket(host)
+            if b:
+                b["findings"].append(line.strip())
+
+    return by_host
+
+
+def phase_report(out: Path, domain: str, scope_targets: list, dork_hits: int = 0):
     console.print(Rule("[bold cyan]PHASE 8 — Generating Summary Report[/bold cyan]"))
 
     report = out / "reports" / "summary.md"
     now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def c(f):
-        return str(count_lines(out / f)) if (out / f).exists() else "0"
+        return count_lines(out / f) if (out / f).exists() else 0
 
-    content = f"""# Sayad Recon Report — {domain}
-**Date:** {now}
+    # Build per-target breakdown (params/endpoints/dirs/findings grouped by host)
+    per_target = _build_per_target_breakdown(out, scope_targets)
 
----
+    # Aggregate counts
+    total_params    = sum(len(b["params"])    for b in per_target.values())
+    total_endpoints = sum(len(b["endpoints"]) for b in per_target.values())
+    total_dirs      = sum(len(b["dirs"])      for b in per_target.values())
+    total_findings  = sum(len(b["findings"])  for b in per_target.values())
 
-## Statistics
+    # ── Header + top-level stats ──────────────────────────────
+    lines = []
+    lines.append(f"# Sayad Recon Report — {domain}")
+    lines.append(f"**Date:** {now}    **Targets scanned:** {len(scope_targets)}\n")
+    lines.append("---\n")
+    lines.append("## Overview\n")
+    lines.append("| Metric | Count |")
+    lines.append("|--------|------:|")
+    lines.append(f"| Subdomains discovered   | {c('subdomains/all_subdomains.txt')} |")
+    lines.append(f"| Live HTTP hosts         | {c('hosts/live_urls.txt')} |")
+    lines.append(f"| Scoped targets          | {len(scope_targets)} |")
+    lines.append(f"| URLs collected          | {c('urls/all_urls.txt')} |")
+    lines.append(f"| Parameters (unique)     | {c('params/discovered_params.txt')} |")
+    lines.append(f"| Interesting endpoints   | {c('urls/interesting_endpoints.txt')} |")
+    lines.append(f"| Directories (ffuf)      | {total_dirs} |")
+    lines.append(f"| JS files                | {c('js/js_files.txt')} |")
+    lines.append(f"| Potential secrets       | {c('js/potential_secrets.txt')} |")
+    lines.append(f"| Nuclei findings (total) | {c('nuclei/findings.txt')} |")
+    lines.append(f"| Critical / High         | **{c('nuclei/critical_high.txt')}** |")
+    lines.append(f"| GitHub dork hits        | {dork_hits} |")
+    lines.append("\n---\n")
 
-| Phase | Result |
-|-------|--------|
-| Subdomains Discovered | {c("subdomains/all_subdomains.txt")} |
-| Live HTTP Hosts | {c("hosts/live_urls.txt")} |
-| Total URLs | {c("urls/all_urls.txt")} |
-| Interesting Endpoints | {c("urls/interesting_endpoints.txt")} |
-| JS Files | {c("js/js_files.txt")} |
-| Potential Secrets | {c("js/potential_secrets.txt")} |
-| JS Endpoints | {c("js/js_endpoints.txt")} |
-| Parameters Discovered | {c("params/discovered_params.txt")} |
-| Nuclei Findings | {c("nuclei/findings.txt")} |
-| Critical/High | {c("nuclei/critical_high.txt")} |
-| GitHub Dork Hits | {dork_hits} |
+    # ── Per-target breakdown (the main addition) ──────────────
+    lines.append("## Per-Target Breakdown\n")
+    lines.append(
+        "_For each scoped target below: discovered parameters, interesting "
+        "endpoints, directories (from ffuf), and vulnerabilities (from Nuclei)._\n"
+    )
 
----
+    # Sort targets by #findings desc, then by hostname — most interesting first.
+    def _rank(item):
+        _, b = item
+        return (-len(b["findings"]), -len(b["dirs"]), b["target"])
 
-## Critical/High Findings
-"""
+    for host, b in sorted(per_target.items(), key=_rank):
+        target      = b["target"]
+        params      = sorted(b["params"])
+        endpoints   = sorted(b["endpoints"])
+        dirs_hits   = b["dirs"]
+        findings    = b["findings"]
+        crit_count  = sum(1 for f in findings if re.search(r'\[(critical|high)\]', f, re.I))
+
+        # Header line per target with inline stats
+        lines.append(f"### `{target}`")
+        lines.append(
+            f"- **Parameters:** {len(params)}  "
+            f"|  **Endpoints:** {len(endpoints)}  "
+            f"|  **Directories:** {len(dirs_hits)}  "
+            f"|  **Vulns:** {len(findings)}"
+            + (f"  🚨 **{crit_count} Crit/High**" if crit_count else "")
+        )
+
+        # Vulnerabilities first (highest value)
+        if findings:
+            lines.append("\n<details><summary>Vulnerabilities</summary>\n")
+            for f in findings[:40]:
+                lines.append(f"- {f}")
+            if len(findings) > 40:
+                lines.append(f"- _…{len(findings) - 40} more, see `nuclei/findings.txt`_")
+            lines.append("\n</details>\n")
+        else:
+            lines.append("- _No Nuclei findings._")
+
+        if dirs_hits:
+            lines.append("<details><summary>Directories</summary>\n")
+            for h in dirs_hits[:30]:
+                lines.append(f"- `[{h['status']}]` {h['url']}  _(len {h['length']})_")
+            if len(dirs_hits) > 30:
+                lines.append(f"- _…{len(dirs_hits) - 30} more in `dirs/ffuf_*.json`_")
+            lines.append("\n</details>\n")
+
+        if endpoints:
+            lines.append("<details><summary>Interesting endpoints</summary>\n")
+            for e in endpoints[:30]:
+                lines.append(f"- {e}")
+            if len(endpoints) > 30:
+                lines.append(f"- _…{len(endpoints) - 30} more_")
+            lines.append("\n</details>\n")
+
+        if params:
+            lines.append("<details><summary>Parameters</summary>\n")
+            # Dense formatting: backticked, comma-separated, capped
+            capped = params[:80]
+            lines.append(", ".join(f"`{p}`" for p in capped))
+            if len(params) > 80:
+                lines.append(f"\n_…{len(params) - 80} more_")
+            lines.append("\n</details>\n")
+
+        lines.append("")  # blank line between targets
+
+    lines.append("---\n")
+
+    # ── Global highlights (cross-target) ──────────────────────
     crit_file = out / "nuclei" / "critical_high.txt"
-    content += crit_file.read_text(errors="ignore") if crit_file.exists() else "_None found._\n"
+    lines.append("## Critical / High Findings (Global)\n")
+    if crit_file.exists() and count_lines(crit_file) > 0:
+        lines.append("```")
+        lines.append(crit_file.read_text(errors="ignore").strip())
+        lines.append("```\n")
+    else:
+        lines.append("_None._\n")
 
-    content += "\n---\n## Potential Secrets in JS\n"
     sec_file = out / "js" / "potential_secrets.txt"
-    if sec_file.exists():
-        lines = sec_file.read_text(errors="ignore").splitlines()
-        content += "\n".join(lines[:20])
-        if len(lines) > 20:
-            content += f"\n\n_...and {len(lines)-20} more (see full file)_"
+    lines.append("## Potential Secrets in JS\n")
+    if sec_file.exists() and count_lines(sec_file) > 0:
+        sec_lines = sec_file.read_text(errors="ignore").splitlines()
+        lines.append("```")
+        lines.extend(sec_lines[:30])
+        if len(sec_lines) > 30:
+            lines.append(f"...and {len(sec_lines) - 30} more — see js/potential_secrets.txt")
+        lines.append("```\n")
     else:
-        content += "_None found._\n"
-
-    content += "\n---\n## Interesting Endpoints (top 30)\n"
-    ep_file = out / "urls" / "interesting_endpoints.txt"
-    if ep_file.exists():
-        content += "\n".join(ep_file.read_text(errors="ignore").splitlines()[:30])
-    else:
-        content += "_None found._\n"
+        lines.append("_None found._\n")
 
     if dork_hits:
-        content += "\n---\n## GitHub Dork Hits\n"
+        lines.append("## GitHub Dork Hits\n")
         dork_file = out / "github_dorks" / "findings.txt"
         if dork_file.exists():
-            content += "\n".join(dork_file.read_text(errors="ignore").splitlines()[:40])
-        else:
-            content += f"_{dork_hits} hits (see github_dorks/findings.txt)_\n"
+            dlines = dork_file.read_text(errors="ignore").splitlines()
+            lines.append("```")
+            lines.extend(dlines[:40])
+            if len(dlines) > 40:
+                lines.append(f"...and {len(dlines) - 40} more")
+            lines.append("```\n")
 
-    content += "\n\n---\n*Generated by Sayad Recon Framework*\n"
-    report.write_text(content)
+    lines.append("\n---\n*Generated by Sayad Recon Framework*\n")
+    report.write_text("\n".join(lines))
     console.print(f"[green][+][/green] Report saved → [cyan]{report}[/cyan]")
 
 
@@ -861,6 +1173,8 @@ Examples:
     parser.add_argument("--llm-model",     default="llama3",             metavar="MODEL", help="Ollama model (default: llama3)")
     parser.add_argument("--llm-url",       default="http://localhost:11434", metavar="URL", help="Ollama API URL")
     parser.add_argument("-y", "--yes",     action="store_true", help="Skip authorization confirmation prompt (use for CI/automated scans)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show tool stderr and per-item diagnostics (otherwise: summary counts only)")
+    parser.add_argument("--skip-dirs",     action="store_true", help="Skip ffuf directory discovery phase")
     return parser.parse_args()
 
 
@@ -869,10 +1183,11 @@ Examples:
 # ─────────────────────────────────────────────────────────────
 
 def main():
-    global _checkpoint, _domain, _out
+    global _checkpoint, _domain, _out, _verbose
 
-    args   = parse_args()
-    _domain = args.domain.strip()
+    args     = parse_args()
+    _domain  = args.domain.strip()
+    _verbose = args.verbose
 
     # ── Domain validation ─────────────────────────────────────
     valid, err = validate_domain(_domain)
@@ -913,7 +1228,7 @@ def main():
     if not args.resume:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir   = base / timestamp
-        for sub in ["subdomains","hosts","urls","ports","nuclei","js","params","osint","reports","github_dorks"]:
+        for sub in ["subdomains","hosts","urls","ports","nuclei","js","params","osint","reports","github_dorks","dirs"]:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         chk_mgr.init(run_dir, args)
 
@@ -1005,6 +1320,29 @@ def main():
         console.print(f"  [dim]... and {len(scope_targets) - 10} more[/dim]")
     console.print()
 
+    # ── Write a comprehensive targets.txt (everything discovered, not just scoped) ──
+    # This file is useful for manual follow-up work and for feeding downstream tools.
+    targets_file = run_dir / "targets.txt"
+    with open(targets_file, "w") as f:
+        f.write(f"# Sayad Recon — Targets for {_domain}\n")
+        f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"# === Scoped Targets ({len(scope_targets)}) — actively scanned ===\n")
+        for t in scope_targets:
+            f.write(t + "\n")
+        f.write(f"\n# === All Discovered Subdomains ({len(subdomains)}) ===\n")
+        for s in sorted(subdomains):
+            f.write(s + "\n")
+        # live_hosts may be raw httpx lines; strip to clean URLs for this list
+        clean_live = []
+        for line in live_hosts:
+            m = re.match(r'(https?://\S+)', line)
+            if m:
+                clean_live.append(m.group(1).rstrip("/"))
+        f.write(f"\n# === All Live Hosts ({len(clean_live)}) ===\n")
+        for h in sorted(set(clean_live)):
+            f.write(h + "\n")
+    console.print(f"[green][+][/green] Full targets list → [cyan]{targets_file}[/cyan]\n")
+
     # ─────────────────────────────────────────────────────────
     # PHASE 4 — URL & Endpoint Discovery
     # ─────────────────────────────────────────────────────────
@@ -1049,6 +1387,17 @@ def main():
         console.print(Rule("[dim]PHASE 7 — Skipped (checkpoint)[/dim]"))
 
     # ─────────────────────────────────────────────────────────
+    # PHASE 7b — Directory Discovery (ffuf)
+    # ─────────────────────────────────────────────────────────
+    if args.skip_dirs:
+        console.print(Rule("[dim]PHASE — Directory Discovery — Skipped (--skip-dirs)[/dim]"))
+    elif not chk_mgr.is_done("phase_dirs"):
+        phase_dirs(run_dir, scope_targets, args.threads)
+        chk_mgr.complete("phase_dirs", {})
+    else:
+        console.print(Rule("[dim]PHASE — Directory Discovery — Skipped (checkpoint)[/dim]"))
+
+    # ─────────────────────────────────────────────────────────
     # PHASE 8 — GitHub Dorking (optional, --github-dork)
     # ─────────────────────────────────────────────────────────
     dork_hits = 0
@@ -1066,7 +1415,7 @@ def main():
     # ─────────────────────────────────────────────────────────
     # PHASE — Summary Report
     # ─────────────────────────────────────────────────────────
-    phase_report(run_dir, _domain, dork_hits=dork_hits)
+    phase_report(run_dir, _domain, scope_targets, dork_hits=dork_hits)
     chk_mgr.mark_complete()
 
     # ─────────────────────────────────────────────────────────

@@ -117,6 +117,78 @@ def run_tool(cmd: list, out_file: Path = None, timeout: int = 300) -> str:
         return ""
 
 
+def run_tool_live(
+    cmd: list,
+    out_file: Path = None,
+    timeout: int = 900,
+    label: str = "",
+    highlight_fn=None,
+) -> str:
+    """
+    Run an external tool and stream its output line-by-line to the console.
+
+    Designed for long-running phases (nuclei, ffuf) where the user needs
+    real-time visibility. Each output line is printed as it arrives so the
+    operator can see:
+      - findings as they are discovered
+      - periodic statistics / error rates
+      - whether the tool is actually doing anything (vs. silently 403-ing)
+
+    Args:
+        highlight_fn: optional callable(line: str) -> str | None.
+                      Return a Rich-markup string to override the default dim
+                      rendering, or None to use the default.  Return "" to
+                      suppress the line entirely.
+    Returns:
+        The full captured stdout as a string (same as run_tool).
+    """
+    prefix = f"[dim][{label or cmd[0]}][/dim] " if (label or _verbose) else ""
+    output_lines: list = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr so stats/errors are visible
+            text=True,
+            bufsize=1,
+        )
+
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip()
+                if not line:
+                    continue
+                output_lines.append(line)
+
+                # Caller can customise how lines are rendered
+                rendered = highlight_fn(line) if highlight_fn else None
+                if rendered is None:
+                    console.print(f"{prefix}[dim]{line}[/dim]")
+                elif rendered:               # non-empty → use as-is
+                    console.print(rendered)
+                # rendered == "" → suppress
+
+            proc.wait(timeout=timeout)
+
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            console.print(f"[yellow][!][/yellow] {cmd[0]} timed out after {timeout}s — partial results saved.")
+
+    except FileNotFoundError:
+        console.print(f"[yellow][!][/yellow] Tool not found: [bold]{cmd[0]}[/bold] — skipping.")
+        return ""
+    except Exception as exc:
+        console.print(f"[yellow][!][/yellow] {cmd[0]} error: {exc}")
+        return ""
+
+    output = "\n".join(output_lines)
+    if out_file and output:
+        out_file.write_text(output)
+    return output
+
+
 def count_lines(path: Path) -> int:
     try:
         return sum(1 for l in path.read_text(errors="ignore").splitlines() if l.strip())
@@ -637,7 +709,8 @@ def phase_params(out: Path, scope_targets: list):
 # Phase 6 — Nuclei Vulnerability Scanning
 # ─────────────────────────────────────────────────────────────
 
-def phase_nuclei(out: Path, scope_targets: list, severity: str, threads: int, notifier=None, domain: str = ""):
+def phase_nuclei(out: Path, scope_targets: list, severity: str, threads: int,
+                 notifier=None, domain: str = "", rate_limit: int = 150):
     console.print(Rule("[bold cyan]PHASE 6 — Nuclei Vulnerability Scanning[/bold cyan]"))
 
     nuclei_dir = out / "nuclei"
@@ -646,10 +719,10 @@ def phase_nuclei(out: Path, scope_targets: list, severity: str, threads: int, no
         console.print("[yellow][!][/yellow] No targets in scope — skipping Nuclei.")
         return
 
-    # Use scope_targets directly — they already represent the confirmed live hosts
     scoped_file = nuclei_dir / "scoped_live.txt"
     scoped_file.write_text("\n".join(scope_targets))
-    console.print(f"[green][+][/green] Scanning [bold]{len(scope_targets)}[/bold] scoped targets")
+    console.print(f"[green][+][/green] Scanning [bold]{len(scope_targets)}[/bold] scoped target(s)")
+    console.print(f"[dim]  Tip: press Ctrl+C at any time to save a checkpoint and resume later.[/dim]")
 
     with console.status("[cyan]Updating Nuclei templates...[/cyan]"):
         run_tool(["nuclei", "-update-templates", "-silent"], timeout=120)
@@ -657,29 +730,110 @@ def phase_nuclei(out: Path, scope_targets: list, severity: str, threads: int, no
     findings      = nuclei_dir / "findings.txt"
     findings_json = nuclei_dir / "findings.json"
 
-    with console.status(f"[cyan]Running Nuclei (severity: {severity})...[/cyan]"):
-        run_tool([
+    # ── Live-feedback renderer ────────────────────────────────
+    # Counters shared via a mutable container so the closure can mutate them.
+    counters = {"finds": 0, "errors": 0, "403s": 0, "crits": 0}
+
+    sev_colours = {
+        "critical": "bold red",
+        "high":     "red",
+        "medium":   "yellow",
+        "low":      "cyan",
+        "info":     "dim",
+    }
+
+    def _render(line: str):
+        """
+        Classify and colour each nuclei output line:
+          • finding lines   → highlighted by severity, printed normally
+          • [ERR]/[WRN]     → yellow (suppressed unless verbose)
+          • [INF] stats     → dim (always shown — this is the heartbeat)
+          • everything else → dim (tool noise)
+        Returns a Rich-markup string or "" to suppress.
+        """
+        # Nuclei finding lines contain [template-id] [severity] url
+        sev_m = re.search(r'\[(critical|high|medium|low|info)\]', line, re.I)
+        if sev_m and re.search(r'https?://', line):
+            sev  = sev_m.group(1).lower()
+            col  = sev_colours.get(sev, "white")
+            counters["finds"] += 1
+            if sev in ("critical", "high"):
+                counters["crits"] += 1
+                if notifier and counters["crits"] == 1:
+                    notifier.critical_found(domain, line.strip())
+            return f"[{col}]  [FIND] {line.strip()}[/{col}]"
+
+        # Stats heartbeat from -stats
+        if "[INF]" in line or "[stats]" in line.lower():
+            # Highlight if 403 rate looks high
+            if "403" in line:
+                counters["403s"] += 1
+            return f"[dim]  {line.strip()}[/dim]"
+
+        # Errors / warnings
+        if "[ERR]" in line or "[WRN]" in line:
+            counters["errors"] += 1
+            if "403" in line:
+                counters["403s"] += 1
+            if _verbose:
+                return f"[yellow]  {line.strip()}[/yellow]"
+            return ""          # suppress in normal mode
+
+        return ""              # suppress all other tool noise
+
+    console.print(
+        f"[dim]  Nuclei running live — findings appear below as discovered "
+        f"(stats every 30s):[/dim]"
+    )
+
+    # -stats/-stats-interval give us the 30-second heartbeat so the user can
+    # see that the tool is alive even if there are no findings.
+    # We do NOT pass -silent — the live stream IS the output.
+    run_tool_live(
+        [
             "nuclei", "-l", str(scoped_file),
             "-severity", severity,
             "-c", str(threads),
+            "-rl", str(rate_limit),        # requests/sec rate limit
             "-o", str(findings),
             "-json-export", str(findings_json),
-            "-silent",
-        ], timeout=900)
+            "-stats",
+            "-stats-interval", "30",
+        ],
+        timeout=1200,
+        label="nuclei",
+        highlight_fn=_render,
+    )
 
+    # ── Post-scan summary ────────────────────────────────────
+    console.print()
+    if counters["finds"]:
+        console.print(f"[green][+][/green] Nuclei findings: [bold]{counters['finds']}[/bold]")
+    else:
+        console.print("[dim]  No Nuclei findings.[/dim]")
+
+    if counters["crits"]:
+        console.print(f"[red][!][/red] Critical/High: [bold red]{counters['crits']}[/bold red]")
+
+    if counters["403s"] >= 5:
+        console.print(
+            f"[yellow][!][/yellow] [bold yellow]{counters['403s']}[/bold yellow] 403 responses "
+            f"detected — target may be WAF-protected. "
+            f"Try [bold]--nuclei-rate[/bold] with a lower value (e.g. 30)."
+        )
+    elif counters["errors"] >= 10 and not counters["finds"]:
+        console.print(
+            f"[yellow][!][/yellow] {counters['errors']} errors, 0 findings — "
+            f"target may be blocking probes. Check connectivity or lower rate."
+        )
+
+    # Keep critical_high.txt up to date even when -o writes incrementally
     if findings.exists():
-        hits  = count_lines(findings)
         crits = [
             l for l in findings.read_text(errors="ignore").splitlines()
             if re.search(r'\[(critical|high)\]', l, re.I)
         ]
         (nuclei_dir / "critical_high.txt").write_text("\n".join(crits))
-        console.print(f"[green][+][/green] Nuclei findings: [bold]{hits}[/bold]")
-        if crits:
-            console.print(f"[red][!][/red] Critical/High: [bold red]{len(crits)}[/bold red]")
-            # Notify immediately on critical/high
-            if notifier and crits:
-                notifier.critical_found(domain, crits[0])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1164,6 +1318,8 @@ Examples:
         ),
     )
     parser.add_argument("--skip-nuclei",   action="store_true", help="Skip Nuclei scanning")
+    parser.add_argument("--nuclei-rate",   type=int, default=150, metavar="N",
+                        help="Nuclei max requests/sec (default: 150). Lower to 30-50 if getting many 403s.")
     parser.add_argument("--skip-portscan", action="store_true", help="Skip Nmap port scan")
     parser.add_argument("--skip-crawl",    action="store_true", help="Skip URL crawling")
     parser.add_argument("--skip-js",       action="store_true", help="Skip JS analysis (run later with js_analyze.py)")
@@ -1368,7 +1524,7 @@ def main():
     if not args.skip_nuclei:
         if not chk_mgr.is_done("phase6"):
             phase_nuclei(run_dir, scope_targets, args.severity, args.threads,
-                         notifier=notifier, domain=_domain)
+                         notifier=notifier, domain=_domain, rate_limit=args.nuclei_rate)
             chk_mgr.complete("phase6", {})
         else:
             console.print(Rule("[dim]PHASE 6 — Skipped (checkpoint)[/dim]"))
